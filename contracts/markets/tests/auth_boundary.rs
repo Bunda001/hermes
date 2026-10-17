@@ -137,7 +137,9 @@ fn test_transfer_ownership_succeeds_with_admin() {
     client.transfer_ownership(&admin, &new_admin);
 
     let stored = client.get_admin().unwrap();
-    assert_eq!(stored, new_admin);
+    assert_eq!(stored, admin);
+    client.set_pause_config(&new_admin, &0, &1);
+    assert_eq!(client.get_pause_config(), (0, 1));
 }
 
 #[test]
