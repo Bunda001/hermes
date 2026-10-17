@@ -6,6 +6,24 @@
 //! Provides a prediction-market subsystem where every state-changing
 //! entrypoint enforces `require_auth` on the acting [`Address`].
 //!
+//! # User Balance Fee Model
+//!
+//! Deposits are fee-free: `deposit_user_balance` credits the full deposited
+//! amount to the user's internal balance. Fees are charged on exit instead.
+//! `withdraw_user_balance` charges the greater of the configured minimum fee
+//! and the basis-point fee on the requested withdrawal amount, except when
+//! dust or full-withdrawal rules waive the fee. It removes the requested amount
+//! from the internal balance and returns the post-fee `net_amount`; it does not
+//! transfer tokens. `collect_user_fees` is a separate admin-triggered charge
+//! based on the user's full current balance; it deducts from that balance and
+//! adds to the collected-fees counter, without transferring tokens out of the
+//! contract.
+//!
+//! These two fee paths are not mutually exclusive. An admin collection does
+//! not mark funds as already charged, so a later user withdrawal can charge
+//! another fee on the remaining balance. Callers should not use both paths for
+//! the same funds when only one fee is intended.
+//!
 //! # Auth Matrix
 //!
 //! | Function                    | Required Role              |
@@ -1134,6 +1152,9 @@ impl MarketsContract {
     }
 
     /// Deposits funds into a user's internal withdrawable balance (#012).
+    ///
+    /// No fee is charged on deposit; the full `amount` is transferred in and
+    /// credited to the user's internal balance.
     pub fn deposit_user_balance(env: Env, user: Address, amount: i128) {
         user.require_auth();
 
@@ -1161,6 +1182,14 @@ impl MarketsContract {
     }
 
     /// Withdraws funds from a user's balance with dust protection (#012).
+    ///
+    /// The fee is calculated from the requested `amount` as the greater of
+    /// the configured minimum and the basis-point fee. The full requested
+    /// amount is removed from the internal balance, and the post-fee amount is
+    /// returned as `net_amount`; this method does not transfer tokens. The fee
+    /// is added to the collected-fees counter. This is independent of
+    /// `collect_user_fees`, so both paths can charge fees against the same
+    /// funds at different times.
     ///
     /// # Dust Invariant
     /// If the user's available balance is `<= min_fee_amount`, it is classified
@@ -1228,6 +1257,11 @@ impl MarketsContract {
     }
 
     /// Admin fee collection from user account with dust-safe protection (#012).
+    ///
+    /// This charges against the user's full current internal balance and adds
+    /// the amount to the collected-fees counter; it does not transfer tokens
+    /// out of the contract. It is independent of `withdraw_user_balance`, so
+    /// a later withdrawal can charge another fee on the remaining balance.
     ///
     /// If a user balance is `<= min_fee_amount`, fees are not collected and 0 is returned,
     /// ensuring dust is never locked and `InsufficientBalance` is never thrown.

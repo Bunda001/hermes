@@ -380,20 +380,20 @@ impl Analytics {
             .get(points_key)
             .unwrap_or_else(|| Vec::new(env));
 
-        if points.len() >= max_capacity {
+        let summary = env
+            .storage()
+            .persistent()
+            .get::<DataKey, MetricSummary>(summary_key);
+        let current_count = summary.as_ref().map(|s| s.total_count).unwrap_or(0);
+        if current_count >= max_capacity {
             return Err(ContractError::StoreFull);
         }
 
-        points.push_back(DataPoint { timestamp, value });
-        env.storage().persistent().set(points_key, &points);
-
-        // Update summary
-        let summary = if let Some(mut s) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, MetricSummary>(summary_key)
-        {
-            s.total_count += 1;
+        let next_summary = if let Some(mut s) = summary {
+            s.total_count = s
+                .total_count
+                .checked_add(1)
+                .ok_or(ContractError::Overflow)?;
             s.total_sum = s
                 .total_sum
                 .checked_add(value)
@@ -419,7 +419,11 @@ impl Analytics {
             }
         };
 
-        env.storage().persistent().set(summary_key, &summary);
+        points.push_back(DataPoint { timestamp, value });
+        env.storage().persistent().set(points_key, &points);
+        env.storage()
+            .persistent()
+            .set(summary_key, &next_summary);
         Ok(())
     }
 

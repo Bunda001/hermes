@@ -815,6 +815,9 @@ impl FeesContract {
         if config.min_fee_amount > config.max_fee_amount {
             return Err(ContractError::InvalidInput);
         }
+        if config.fees_enabled && config.min_fee_amount == 0 {
+            return Err(ContractError::InvalidInput);
+        }
         Ok(())
     }
 }
