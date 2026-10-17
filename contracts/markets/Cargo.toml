@@ -31,8 +31,7 @@ path = "tests/issues_007_012_014_022.rs"
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 proptest = "1.2.0"
-criterion = { workspace = true }
 
-[[bench]]
-name = "main"
-harness = false
+[[test]]
+name = "auth_boundary"
+path = "tests/auth_boundary.rs"

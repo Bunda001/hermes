@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use markets::{ContractError, MarketsContract, MarketsContractClient};
+use markets::{ContractError, MarketsContract, MarketsContractClient, PayoutCurveConfig};
 use soroban_sdk::{
     testutils::{Address as _, Ledger, LedgerInfo, MockAuth, MockAuthInvoke},
     Address, Env, IntoVal, String, Vec,
@@ -161,6 +161,67 @@ fn test_create_market_requires_auth_success() {
 
     let market_id = create_market_with_auth_check(&setup);
     assert_eq!(market_id, 1);
+}
+
+#[test]
+fn test_market_limit_blocks_both_creation_entrypoints() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    setup.client.transfer_ownership(&setup.admin, &setup.admin);
+    assert_eq!(setup.client.get_market_limit(), 10_000);
+
+    let unauthorized_result = setup
+        .client
+        .try_set_market_limit(&setup.unauthorized, &1);
+    assert_eq!(
+        unauthorized_result.unwrap_err().unwrap(),
+        ContractError::Unauthorized.into()
+    );
+
+    setup.client.set_market_limit(&setup.admin, &1);
+    assert_eq!(setup.client.get_market_limit(), 1);
+    let market_id = create_market_with_auth_check(&setup);
+    assert_eq!(market_id, 1);
+
+    let question = String::from_str(&env, "Another market?");
+    let description = String::from_str(&env, "Description");
+    let end_time = env.ledger().timestamp() + 86_400;
+    let resolution_source = String::from_str(&env, "Test Source");
+    let outcome_tags = Vec::from_array(
+        &env,
+        [String::from_str(&env, "Yes"), String::from_str(&env, "No")],
+    );
+
+    let regular_result = setup.client.try_create_market(
+        &setup.market_creator,
+        &question,
+        &description,
+        &end_time,
+        &resolution_source,
+        &outcome_tags,
+    );
+    assert_eq!(
+        regular_result.unwrap_err().unwrap(),
+        ContractError::MarketLimitReached.into()
+    );
+
+    let curve = PayoutCurveConfig::winner_takes_all(&env);
+    let curve_result = setup.client.try_create_market_with_curve(
+        &setup.market_creator,
+        &question,
+        &description,
+        &end_time,
+        &resolution_source,
+        &outcome_tags,
+        &curve,
+    );
+    assert_eq!(
+        curve_result.unwrap_err().unwrap(),
+        ContractError::MarketLimitReached.into()
+    );
+    assert_eq!(setup.client.get_market_for_resolution(&2), None);
 }
 
 #[test]

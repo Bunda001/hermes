@@ -34,6 +34,7 @@ pub mod gov_registry;
 mod fees;
 mod gas;
 mod governance;
+mod delegation;
 mod markets;
 mod monitoring;
 mod oracles;

@@ -1,654 +1,460 @@
-//! Voting delegation registry for institutional participants.
+//! Voting delegation with per-address power cap.
 //!
-//! This module provides a secure delegation system that allows large institutional
-//! participants to maintain voting rights in cold storage while delegating the
-//! authority to cast votes to dedicated hot wallets. This improves security by
-//! reducing the exposure of high-value accounts to active on-chain operations.
+//! Implements `set_delegate` / `unset_delegate` entrypoints and enforces a
+//! maximum delegation cap: no single address may accumulate delegated voting
+//! power exceeding **10 % of the total voting power** of the market.
 //!
-//! # Overview
+//! # Design
 //!
-//! The delegation registry maintains a mapping of delegators (cold storage accounts)
-//! to delegates (hot wallet accounts). When a user votes, the system checks if they
-//! have an active delegation and validates that the voting authority is properly
-//! established.
+//! * `Delegation` record — stores the delegator→delegatee relationship and
+//!   the amount of voting power that was delegated.
+//! * `DelegationManager` — all storage operations and cap enforcement.
+//! * The cap is enforced at *delegation time* (`set_delegate`). If adding the
+//!   delegator's stake would push the delegatee's total delegated power above
+//!   the cap, the call is rejected with [`Error::DelegationCapExceeded`].
+//! * `unset_delegate` releases the delegated power and removes the record.
 //!
-//! # Security Model
+//! # Storage layout
 //!
-//! - **Delegator-Controlled**: Only the delegator (cold storage account) can establish,
-//!   modify, or revoke a delegation.
-//! - **Single Active Delegation**: Each delegator can have only one active delegate at
-//!   a time to prevent vote splitting and delegation ambiguity.
-//! - **Explicit Revocation**: Delegations must be explicitly revoked; they do not
-//!   expire automatically.
-//! - **No Circular Delegation**: The system prevents circular delegation chains to
-//!   avoid voting authority loops.
-//! - **No Self-Delegation**: An address cannot delegate to itself.
+//! | Key                                   | Value        |
+//! |---------------------------------------|--------------|
+//! | `Delegation(delegator)`               | `Delegation` |
+//! | `DelegatedPower(delegatee)`           | `i128`       |
+//! | `TotalVotingPower`                    | `i128`       |
 //!
-//! # Data Model
-//!
-//! The delegation registry stores two key data structures:
-//! - Delegations: mapped by (delegator, delegate) pair
-//! - Delegation index: maps delegator -> active delegate for fast lookups
-//!
-//! # Events
-//!
-//! The module emits two governance events:
-//! - `set_delegate`: Fired when a delegation is established or modified
-//! - `unset_delegate`: Fired when a delegation is revoked
-//!
-//! # Example Usage
-//!
-//! ```ignore
-//! // Cold storage account delegates voting to hot wallet
-//! DelegationManager::delegate_votes(
-//!     &env,
-//!     cold_storage,  // delegator
-//!     hot_wallet,    // delegate
-//! )?;
-//!
-//! // Later, query if a delegation exists
-//! if let Some(dlg) = DelegationManager::get_delegation(&env, cold_storage, hot_wallet)? {
-//!     println!("Delegation active since: {}", dlg.activated_at);
-//! }
-//!
-//! // Revoke the delegation
-//! DelegationManager::unset_delegate(&env, cold_storage, hot_wallet)?;
-//! ```
+//! All keys live in **instance** storage so they are bumped automatically by
+//! the Soroban runtime.
 
-use crate::errors::Error;
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Env, Map};
 
-// ===== STORAGE KEYS =====
+use crate::err::Error;
 
-/// Storage keys for delegation registry.
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Maximum fraction (in basis points) of total voting power that a single
+/// address may hold through delegation. 1 000 bps = 10 %.
+pub const MAX_DELEGATION_BPS: i128 = 1_000;
+
+/// Denominator for basis-point calculations (100 %).
+pub const BPS_DENOMINATOR: i128 = 10_000;
+
+/// TTL threshold (ledgers) before delegation keys are bumped on read.
+const DELEGATION_TTL_THRESHOLD: u32 = 5_356;
+
+/// Extended TTL (ledgers) for delegation storage entries (~31 days).
+const DELEGATION_TTL_TO: u32 = 518_400;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// Persistent record of an active delegation.
 #[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    /// Delegation record: (delegator, delegate) -> Delegation
-    Delegation(Address, Address),
-    /// Active delegate index: delegator -> delegate
-    ActiveDelegate(Address),
-    /// Revocation history for audit: (delegator, delegate) -> Vec<Revocation>
-    RevocationHistory(Address, Address),
-}
-
-// ===== DATA STRUCTURES =====
-
-/// Represents an active voting delegation from a cold storage account to a hot wallet.
-///
-/// This structure maintains the core delegation data including the delegator,
-/// delegate, and temporal metadata for audit and compliance purposes.
-///
-/// # Fields
-///
-/// - `delegator`: The account with voting rights (cold storage)
-/// - `delegate`: The account authorized to cast votes (hot wallet)
-/// - `activated_at`: Ledger timestamp when delegation was activated
-/// - `last_modified`: Ledger timestamp of last modification
-///
-/// # Security Properties
-///
-/// - Immutable after creation (to preserve audit trail)
-/// - Delegator-controlled (only delegator can create/revoke)
-/// - Non-transferable (delegate cannot transfer delegation)
-#[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Delegation {
-    /// Cold storage account holding voting rights
+    /// The address that delegated their voting power.
     pub delegator: Address,
-    /// Hot wallet account authorized to vote
-    pub delegate: Address,
-    /// Ledger timestamp when this delegation was activated
-    pub activated_at: u64,
-    /// Ledger timestamp of last modification
-    pub last_modified: u64,
+    /// The address receiving the delegated power.
+    pub delegatee: Address,
+    /// Amount of voting power delegated (in stroops / base units).
+    pub amount: i128,
 }
 
-/// Configuration and constraints for the delegation system.
-///
-/// This structure defines the security parameters and operational limits
-/// for the delegation registry, allowing for governance-controlled adjustments
-/// without requiring code changes.
-///
-/// # Fields
-///
-/// - `max_delegations_per_account`: Maximum number of accounts an entity can delegate to/from
-/// - `allow_revocation_without_cooldown`: Whether revocations can happen immediately
-/// - `enable_circular_check`: Whether to enforce prevention of circular delegation
-///
-/// # Security Considerations
-///
-/// - Lower `max_delegations_per_account` reduces attack surface
-/// - `allow_revocation_without_cooldown: false` adds time delays for security
-/// - `enable_circular_check: true` prevents delegation loops
+/// Storage keys used by the delegation subsystem.
 #[contracttype]
-#[derive(Clone)]
-pub struct DelegationConfig {
-    /// Maximum active delegations from a single delegator (prevents account sprawl)
-    pub max_delegations_per_account: u32,
-    /// Allow immediate revocation without cooldown period
-    pub allow_revocation_without_cooldown: bool,
-    /// Enforce prevention of circular delegation chains
-    pub enable_circular_check: bool,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DelegationKey {
+    /// Active delegation record keyed by delegator address.
+    Delegation(Address),
+    /// Cumulative delegated power received by a delegatee.
+    DelegatedPower(Address),
+    /// Global running total of all voting power in the system.
+    TotalVotingPower,
 }
 
-/// Audit record of a delegation revocation.
-///
-/// This structure maintains a complete audit trail of delegation revocations
-/// for compliance and forensic purposes. Multiple revocations can occur for
-/// the same delegator-delegate pair if a delegation is reinstated and revoked
-/// again.
-///
-/// # Fields
-///
-/// - `delegator`: Account that held the delegation
-/// - `delegate`: Account that had voting authority
-/// - `revoked_at`: Ledger timestamp of revocation
-/// - `reason`: Optional reason for revocation (for governance tracking)
-#[contracttype]
-#[derive(Clone)]
-pub struct Revocation {
-    /// Account that previously delegated
-    pub delegator: Address,
-    /// Account that had voting authority
-    pub delegate: Address,
-    /// Ledger timestamp when delegation was revoked
-    pub revoked_at: u64,
-    /// Optional reason for revocation
-    pub reason: Option<Symbol>,
-}
+// ---------------------------------------------------------------------------
+// Manager
+// ---------------------------------------------------------------------------
 
-// ===== DELEGATION MANAGER =====
-
-/// Core delegation management functionality.
-///
-/// DelegationManager provides all operations needed to establish, query, and
-/// revoke voting delegations. All state-changing operations enforce proper
-/// authentication and security constraints.
+/// All delegation storage operations and cap enforcement.
 pub struct DelegationManager;
 
 impl DelegationManager {
-    /// Establish a voting delegation from delegator to delegate.
+    // -----------------------------------------------------------------------
+    //  Public API
+    // -----------------------------------------------------------------------
+
+    /// Activate a delegation: the `delegator` transfers their `stake` amount
+    /// of voting power to `delegatee`.
     ///
-    /// This function creates or updates a delegation, allowing the delegate
-    /// to cast votes on behalf of the delegator. The delegator must provide
-    /// authorization for the operation.
-    ///
-    /// # Arguments
-    ///
-    /// - `env`: Soroban environment
-    /// - `delegator`: Account with voting rights (must authorize)
-    /// - `delegate`: Account to receive voting authority
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(())` on successful delegation establishment
-    /// - `Err(Error)` if validation fails
+    /// # Cap enforcement
+    /// The delegatee's new total delegated power must not exceed
+    /// `MAX_DELEGATION_BPS / BPS_DENOMINATOR` of [`TotalVotingPower`].
     ///
     /// # Errors
-    ///
-    /// - `DelegationSelfDelegation`: Attempted to delegate to self
-    /// - `DelegationCircular`: Delegation would create a circular chain
-    /// - `Unauthorized`: Delegator did not provide authorization
-    ///
-    /// # Security Checks
-    ///
-    /// - Requires delegator authentication via `delegator.require_auth()`
-    /// - Prevents self-delegation
-    /// - Checks for circular delegation if configured
-    /// - Prevents delegation to an account that already delegates to the delegator
-    ///
-    /// # Events
-    ///
-    /// Emits `set_delegate` event with delegator and delegate addresses.
-    pub fn delegate_votes(env: &Env, delegator: Address, delegate: Address) -> Result<(), Error> {
-        // Require delegator authorization
+    /// * [`Error::InvalidInput`] — `stake` is not positive.
+    /// * [`Error::InvalidInput`] — delegator and delegatee are the same.
+    /// * [`Error::DelegationCapExceeded`] — cap would be exceeded.
+    pub fn set_delegate(
+        env: &Env,
+        delegator: &Address,
+        delegatee: &Address,
+        stake: i128,
+    ) -> Result<(), Error> {
         delegator.require_auth();
 
-        // Validate inputs
-        Self::validate_delegation(&env, &delegator, &delegate)?;
-
-        // Get current timestamp
-        let now = env.ledger().timestamp();
-
-        // Check for existing delegation to remove old one (single active delegate per delegator)
-        if let Some(old_delegate) = Self::get_active_delegate(&env, &delegator) {
-            if old_delegate != delegate {
-                // Update the delegation by removing the old one from index
-                let key = DataKey::ActiveDelegate(delegator.clone());
-                env.storage().persistent().remove(&key);
-            }
+        if stake <= 0 {
+            return Err(Error::InvalidInput);
+        }
+        if delegator == delegatee {
+            return Err(Error::InvalidInput);
         }
 
-        // Create or update delegation
-        let delegation = Delegation {
+        // If the delegator already has an active delegation, remove the old
+        // one first so we don't double-count.
+        if let Some(existing) = Self::get_delegation(env, delegator) {
+            if existing.delegatee == *delegatee && existing.amount == stake {
+                // Idempotent: same delegation already active.
+                return Ok(());
+            }
+            Self::remove_delegation_power(env, &existing.delegatee, existing.amount)?;
+        }
+
+        // Check cap BEFORE writing.
+        let total_power = Self::get_total_voting_power(env);
+        let current_delegated = Self::get_delegated_power(env, delegatee);
+        let new_delegated = current_delegated
+            .checked_add(stake)
+            .ok_or(Error::Overflow)?;
+
+        let cap = Self::delegation_cap(total_power);
+        if new_delegated > cap {
+            return Err(Error::DelegationCapExceeded);
+        }
+
+        // Write the new delegation record.
+        let record = Delegation {
             delegator: delegator.clone(),
-            delegate: delegate.clone(),
-            activated_at: now,
-            last_modified: now,
+            delegatee: delegatee.clone(),
+            amount: stake,
         };
-
-        let key = DataKey::Delegation(delegator.clone(), delegate.clone());
-        env.storage().persistent().set(&key, &delegation);
-
-        // Set active delegate index
-        let idx_key = DataKey::ActiveDelegate(delegator.clone());
-        env.storage().persistent().set(&idx_key, &delegate);
-
-        // Emit event
-        env.events().publish((symbol_short!("gov_dlgset"),), (delegator, delegate));
+        Self::store_delegation(env, &record);
+        Self::add_delegated_power(env, delegatee, stake)?;
 
         Ok(())
     }
 
-    /// Revoke a voting delegation for the specified delegator-delegate pair.
-    ///
-    /// This function removes the delegation, restoring full voting authority to
-    /// the delegator. The delegator must provide authorization. This operation
-    /// is irreversible without re-establishing the delegation.
-    ///
-    /// # Arguments
-    ///
-    /// - `env`: Soroban environment
-    /// - `delegator`: Account that established the delegation
-    /// - `delegate`: Account currently holding voting authority
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(())` on successful revocation
-    /// - `Err(Error)` if delegation does not exist or auth fails
+    /// Remove an active delegation, releasing the delegated voting power.
     ///
     /// # Errors
-    ///
-    /// - `DelegationNotFound`: No delegation exists for this pair
-    /// - `Unauthorized`: Delegator did not provide authorization
-    ///
-    /// # Security Checks
-    ///
-    /// - Requires delegator authentication via `delegator.require_auth()`
-    /// - Verifies delegation exists before revocation
-    /// - Records revocation in audit trail
-    ///
-    /// # Events
-    ///
-    /// Emits `unset_delegate` event with delegator and delegate addresses.
-    pub fn unset_delegate(env: &Env, delegator: Address, delegate: Address) -> Result<(), Error> {
-        // Require delegator authorization
+    /// * [`Error::InvalidInput`] — no active delegation for this delegator.
+    pub fn unset_delegate(env: &Env, delegator: &Address) -> Result<(), Error> {
         delegator.require_auth();
 
-        // Verify delegation exists
-        Self::get_delegation(&env, &delegator, &delegate)?
-            .ok_or(Error::DelegationNotFound)?;
+        let record = Self::get_delegation(env, delegator)
+            .ok_or(Error::InvalidInput)?;
 
-        // Get current timestamp
-        let now = env.ledger().timestamp();
-
-        // Record revocation in history for audit
-        let history_key = DataKey::RevocationHistory(delegator.clone(), delegate.clone());
-        let mut revocations: Vec<Revocation> = env
-            .storage()
-            .persistent()
-            .get(&history_key)
-            .unwrap_or_else(|| Vec::new(env));
-
-        revocations.push_back(Revocation {
-            delegator: delegator.clone(),
-            delegate: delegate.clone(),
-            revoked_at: now,
-            reason: None,
-        });
-
-        env.storage()
-            .persistent()
-            .set(&history_key, &revocations);
-
-        // Remove delegation
-        let key = DataKey::Delegation(delegator.clone(), delegate.clone());
-        env.storage().persistent().remove(&key);
-
-        // Remove from active delegate index if it's the current delegate
-        if let Some(active) = Self::get_active_delegate(&env, &delegator) {
-            if active == delegate {
-                let idx_key = DataKey::ActiveDelegate(delegator.clone());
-                env.storage().persistent().remove(&idx_key);
-            }
-        }
-
-        // Emit event
-        env.events()
-            .publish((symbol_short!("gov_dlguns"),), (delegator, delegate));
+        Self::remove_delegation_power(env, &record.delegatee, record.amount)?;
+        Self::delete_delegation(env, delegator);
 
         Ok(())
     }
 
-    /// Revoke a delegation by the delegate themselves.
-    ///
-    /// This administrative function allows a delegate to revoke their own
-    /// voting authority, useful for immediate disabling if keys are compromised.
-    /// This is called "revoke" to distinguish from "unset" (delegator-initiated).
-    ///
-    /// # Arguments
-    ///
-    /// - `env`: Soroban environment
-    /// - `delegator`: Account that established the delegation
-    /// - `delegate`: Account revoking their own authority (must authorize)
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(())` on successful revocation
-    /// - `Err(Error)` if validation fails
-    ///
-    /// # Events
-    ///
-    /// Emits `unset_delegate` event similar to delegator-initiated revocation.
-    ///
-    /// # Note
-    ///
-    /// This function requires delegate authorization, allowing hot wallets to
-    /// self-disable if needed. This provides an additional security mechanism.
-    pub fn revoke_delegation(env: &Env, delegator: Address, delegate: Address) -> Result<(), Error> {
-        // Require delegate authorization (self-revocation)
-        delegate.require_auth();
-
-        // Verify delegation exists
-        Self::get_delegation(&env, &delegator, &delegate)?
-            .ok_or(Error::DelegationNotFound)?;
-
-        // Get current timestamp
-        let now = env.ledger().timestamp();
-
-        // Record revocation in history
-        let history_key = DataKey::RevocationHistory(delegator.clone(), delegate.clone());
-        let mut revocations: Vec<Revocation> = env
-            .storage()
-            .persistent()
-            .get(&history_key)
-            .unwrap_or_else(|| Vec::new(env));
-
-        revocations.push_back(Revocation {
-            delegator: delegator.clone(),
-            delegate: delegate.clone(),
-            revoked_at: now,
-            reason: Some(symbol_short!("self_rev")), // Self-revocation marker
-        });
-
-        env.storage()
-            .persistent()
-            .set(&history_key, &revocations);
-
-        // Remove delegation
-        let key = DataKey::Delegation(delegator.clone(), delegate.clone());
-        env.storage().persistent().remove(&key);
-
-        // Remove from active delegate index if it's the current delegate
-        if let Some(active) = Self::get_active_delegate(&env, &delegator) {
-            if active == delegate {
-                let idx_key = DataKey::ActiveDelegate(delegator.clone());
-                env.storage().persistent().remove(&idx_key);
-            }
+    /// Read the active delegation for a delegator (read-only).
+    pub fn get_delegation(env: &Env, delegator: &Address) -> Option<Delegation> {
+        let key = DelegationKey::Delegation(delegator.clone());
+        let val: Option<Delegation> = env.storage().instance().get(&key);
+        if val.is_some() {
+            Self::bump_ttl(env, &key);
         }
-
-        // Emit event
-        env.events()
-            .publish((symbol_short!("gov_dlguns"),), (delegator, delegate));
-
-        Ok(())
+        val
     }
 
-    /// Retrieve a specific delegation by delegator and delegate addresses.
-    ///
-    /// # Arguments
-    ///
-    /// - `env`: Soroban environment
-    /// - `delegator`: Cold storage account
-    /// - `delegate`: Hot wallet account
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(Some(delegation))` if the delegation exists
-    /// - `Ok(None)` if no delegation exists
-    /// - `Err(Error)` on storage errors
-    pub fn get_delegation(
-        env: &Env,
-        delegator: &Address,
-        delegate: &Address,
-    ) -> Result<Option<Delegation>, Error> {
-        let key = DataKey::Delegation(delegator.clone(), delegate.clone());
-        let result = env.storage().persistent().get::<_, Delegation>(&key);
-        Ok(result)
-    }
-
-    /// Get the currently active delegate for a delegator.
-    ///
-    /// Each delegator can have at most one active delegate. This function
-    /// retrieves that delegate if one exists.
-    ///
-    /// # Arguments
-    ///
-    /// - `env`: Soroban environment
-    /// - `delegator`: Cold storage account
-    ///
-    /// # Returns
-    ///
-    /// - `Some(delegate)` if an active delegation exists
-    /// - `None` if no active delegation
-    pub fn get_active_delegate(env: &Env, delegator: &Address) -> Option<Address> {
-        let key = DataKey::ActiveDelegate(delegator.clone());
-        env.storage().persistent().get::<_, Address>(&key)
-    }
-
-    /// Check if a specific delegation exists and is active.
-    ///
-    /// # Arguments
-    ///
-    /// - `env`: Soroban environment
-    /// - `delegator`: Cold storage account
-    /// - `delegate`: Hot wallet account
-    ///
-    /// # Returns
-    ///
-    /// - `true` if delegation exists and is active
-    /// - `false` otherwise
-    pub fn has_delegation(env: &Env, delegator: &Address, delegate: &Address) -> bool {
-        Self::get_delegation(env, delegator, delegate)
-            .ok()
-            .flatten()
-            .is_some()
-    }
-
-    /// List all delegations for a specific delegator.
-    ///
-    /// **Note**: This function requires iteration through storage and may be
-    /// expensive with large numbers of delegations. Consider caching the active
-    /// delegate address if only checking voting authority.
-    ///
-    /// # Arguments
-    ///
-    /// - `env`: Soroban environment
-    /// - `delegator`: Account to query delegations for
-    ///
-    /// # Returns
-    ///
-    /// - `Vec<Delegation>` of all active delegations for this delegator
-    pub fn get_delegations_by_delegator(env: &Env, delegator: &Address) -> Result<Vec<Delegation>, Error> {
-        // Get active delegate as the only active delegation
-        if let Some(delegate) = Self::get_active_delegate(env, delegator) {
-            if let Some(delegation) = Self::get_delegation(env, delegator, &delegate)? {
-                let mut result = Vec::new(env);
-                result.push_back(delegation);
-                return Ok(result);
-            }
-        }
-        Ok(Vec::new(env))
-    }
-
-    /// Get the revocation history for a delegator-delegate pair.
-    ///
-    /// This function retrieves the complete audit trail of revocations for
-    /// compliance and forensic purposes.
-    ///
-    /// # Arguments
-    ///
-    /// - `env`: Soroban environment
-    /// - `delegator`: Account that delegated
-    /// - `delegate`: Account that received delegation
-    ///
-    /// # Returns
-    ///
-    /// - `Vec<Revocation>` of all revocations for this pair
-    pub fn get_revocation_history(
-        env: &Env,
-        delegator: &Address,
-        delegate: &Address,
-    ) -> Result<Vec<Revocation>, Error> {
-        let key = DataKey::RevocationHistory(delegator.clone(), delegate.clone());
-        let result: Vec<Revocation> = env
+    /// Total delegated power received by a delegatee (read-only).
+    pub fn get_delegated_power(env: &Env, delegatee: &Address) -> i128 {
+        let key = DelegationKey::DelegatedPower(delegatee.clone());
+        let val: i128 = env
             .storage()
-            .persistent()
+            .instance()
             .get(&key)
-            .unwrap_or_else(|| Vec::new(env));
-        Ok(result)
+            .unwrap_or(0);
+        if val > 0 {
+            Self::bump_ttl(env, &key);
+        }
+        val
     }
 
-    // ===== INTERNAL VALIDATION =====
-
-    /// Validate delegation constraints.
-    ///
-    /// This internal function performs all validation checks before establishing
-    /// a delegation. It checks:
-    /// - Self-delegation prevention
-    /// - Circular delegation prevention
-    /// - Mutual delegation prevention (prevent A->B when B->A exists)
-    fn validate_delegation(env: &Env, delegator: &Address, delegate: &Address) -> Result<(), Error> {
-        // Prevent self-delegation
-        if delegator == delegate {
-            return Err(Error::DelegationSelfDelegation);
+    /// Global total voting power (read-only).  Defaults to 0 when unset.
+    pub fn get_total_voting_power(env: &Env) -> i128 {
+        let key = DelegationKey::TotalVotingPower;
+        let val: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        if val > 0 {
+            Self::bump_ttl(env, &key);
         }
+        val
+    }
 
-        // Prevent circular delegation: if delegate already delegates to delegator
-        if Self::has_delegation(env, delegate, delegator) {
-            return Err(Error::DelegationCircular);
-        }
-
+    /// Update the global total voting power (e.g. when new votes are cast
+    /// outside the delegation system).  Called by the voting module.
+    pub fn set_total_voting_power(env: &Env, total: i128) -> Result<(), Error> {
+        let key = DelegationKey::TotalVotingPower;
+        env.storage().instance().set(&key, &total);
+        Self::bump_ttl(env, &key);
         Ok(())
+    }
+
+    /// Compute the per-address delegation cap given the total voting power.
+    ///
+    /// `cap = total_power * MAX_DELEGATION_BPS / BPS_DENOMINATOR`
+    pub fn delegation_cap(total_power: i128) -> i128 {
+        if total_power <= 0 {
+            return 0;
+        }
+        total_power
+            .checked_mul(MAX_DELEGATION_BPS)
+            .unwrap_or(i128::MAX)
+            .checked_div(BPS_DENOMINATOR)
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    //  Internal helpers
+    // -----------------------------------------------------------------------
+
+    fn store_delegation(env: &Env, record: &Delegation) {
+        let key = DelegationKey::Delegation(record.delegator.clone());
+        env.storage().instance().set(&key, record);
+        Self::bump_ttl(env, &key);
+    }
+
+    fn delete_delegation(env: &Env, delegator: &Address) {
+        let key = DelegationKey::Delegation(delegator.clone());
+        env.storage().instance().remove(&key);
+    }
+
+    fn add_delegated_power(
+        env: &Env,
+        delegatee: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let key = DelegationKey::DelegatedPower(delegatee.clone());
+        let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        let new_val = current.checked_add(amount).ok_or(Error::Overflow)?;
+        env.storage().instance().set(&key, &new_val);
+        Self::bump_ttl(env, &key);
+        Ok(())
+    }
+
+    fn remove_delegation_power(
+        env: &Env,
+        delegatee: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let key = DelegationKey::DelegatedPower(delegatee.clone());
+        let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        let new_val = current.checked_sub(amount).unwrap_or(0);
+        env.storage().instance().set(&key, &new_val);
+        Self::bump_ttl(env, &key);
+        Ok(())
+    }
+
+    fn bump_ttl(env: &Env, key: &DelegationKey) {
+        env.storage()
+            .instance()
+            .extend_ttl(key, DELEGATION_TTL_THRESHOLD, DELEGATION_TTL_TO);
     }
 }
 
-// ===== TESTS =====
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::Env;
+    use soroban_sdk::testutils::Address as _;
 
-    #[test]
-    fn test_delegate_votes_creates_delegation() {
+    fn setup_env() -> Env {
         let env = Env::default();
-        let delegator = Address::generate(&env);
-        let delegate = Address::generate(&env);
-
-        let result = DelegationManager::delegate_votes(&env, delegator.clone(), delegate.clone());
-        assert!(result.is_ok());
-
-        let delegation = DelegationManager::get_delegation(&env, &delegator, &delegate)
-            .unwrap()
-            .unwrap();
-        assert_eq!(delegation.delegator, delegator);
-        assert_eq!(delegation.delegate, delegate);
+        env.mock_all_auths();
+        env
     }
 
     #[test]
-    fn test_self_delegation_fails() {
-        let env = Env::default();
+    fn test_set_delegate_basic() {
+        let env = setup_env();
         let delegator = Address::generate(&env);
+        let delegatee = Address::generate(&env);
 
-        let result = DelegationManager::delegate_votes(&env, delegator.clone(), delegator.clone());
-        assert!(matches!(result, Err(Error::DelegationSelfDelegation)));
+        // Set total voting power so the cap is non-zero.
+        DelegationManager::set_total_voting_power(&env, 1_000_000).unwrap();
+
+        DelegationManager::set_delegate(&env, &delegator, &delegatee, 50_000).unwrap();
+
+        let record = DelegationManager::get_delegation(&env, &delegator);
+        assert!(record.is_some());
+        let record = record.unwrap();
+        assert_eq!(record.delegator, delegator);
+        assert_eq!(record.delegatee, delegatee);
+        assert_eq!(record.amount, 50_000);
+
+        assert_eq!(DelegationManager::get_delegated_power(&env, &delegatee), 50_000);
     }
 
     #[test]
-    fn test_circular_delegation_fails() {
-        let env = Env::default();
-        let addr_a = Address::generate(&env);
-        let addr_b = Address::generate(&env);
+    fn test_unset_delegate_releases_power() {
+        let env = setup_env();
+        let delegator = Address::generate(&env);
+        let delegatee = Address::generate(&env);
 
-        // A delegates to B
-        let result = DelegationManager::delegate_votes(&env, addr_a.clone(), addr_b.clone());
-        assert!(result.is_ok());
+        DelegationManager::set_total_voting_power(&env, 1_000_000).unwrap();
+        DelegationManager::set_delegate(&env, &delegator, &delegatee, 50_000).unwrap();
+        assert_eq!(DelegationManager::get_delegated_power(&env, &delegatee), 50_000);
 
-        // B tries to delegate to A (should fail as circular)
-        let result = DelegationManager::delegate_votes(&env, addr_b.clone(), addr_a.clone());
-        assert!(matches!(result, Err(Error::DelegationCircular)));
+        DelegationManager::unset_delegate(&env, &delegator).unwrap();
+
+        assert!(DelegationManager::get_delegation(&env, &delegator).is_none());
+        assert_eq!(DelegationManager::get_delegated_power(&env, &delegatee), 0);
     }
 
     #[test]
-    fn test_unset_delegate_removes_delegation() {
-        let env = Env::default();
+    fn test_cap_exactly_10_percent_allowed() {
+        let env = setup_env();
         let delegator = Address::generate(&env);
-        let delegate = Address::generate(&env);
+        let delegatee = Address::generate(&env);
 
-        // Create delegation
-        let _ = DelegationManager::delegate_votes(&env, delegator.clone(), delegate.clone());
+        // Total voting power = 1 000 000 → cap = 100 000 (10 %).
+        DelegationManager::set_total_voting_power(&env, 1_000_000).unwrap();
 
-        // Verify it exists
-        assert!(DelegationManager::has_delegation(&env, &delegator, &delegate));
-
-        // Unset delegation
-        let result = DelegationManager::unset_delegate(&env, delegator.clone(), delegate.clone());
-        assert!(result.is_ok());
-
-        // Verify it's gone
-        assert!(!DelegationManager::has_delegation(&env, &delegator, &delegate));
+        // Delegating exactly the cap should succeed.
+        DelegationManager::set_delegate(&env, &delegator, &delegatee, 100_000).unwrap();
+        assert_eq!(DelegationManager::get_delegated_power(&env, &delegatee), 100_000);
     }
 
     #[test]
-    fn test_get_active_delegate() {
-        let env = Env::default();
+    fn test_cap_exceeded_rejected() {
+        let env = setup_env();
         let delegator = Address::generate(&env);
-        let delegate = Address::generate(&env);
+        let delegatee = Address::generate(&env);
 
-        // No active delegate initially
-        assert_eq!(DelegationManager::get_active_delegate(&env, &delegator), None);
+        // Total voting power = 1 000 000 → cap = 100 000 (10 %).
+        DelegationManager::set_total_voting_power(&env, 1_000_000).unwrap();
 
-        // Create delegation
-        let _ = DelegationManager::delegate_votes(&env, delegator.clone(), delegate.clone());
-
-        // Active delegate should match
-        let active = DelegationManager::get_active_delegate(&env, &delegator);
-        assert_eq!(active, Some(delegate));
+        // Delegating 100 001 (just over the cap) should fail.
+        let result =
+            DelegationManager::set_delegate(&env, &delegator, &delegatee, 100_001);
+        assert_eq!(result, Err(Error::DelegationCapExceeded));
+        assert_eq!(DelegationManager::get_delegated_power(&env, &delegatee), 0);
     }
 
     #[test]
-    fn test_revoke_delegation_by_delegate() {
-        let env = Env::default();
-        let delegator = Address::generate(&env);
-        let delegate = Address::generate(&env);
+    fn test_multiple_delegators_cap_enforced() {
+        let env = setup_env();
+        let delegatee = Address::generate(&env);
 
-        // Create delegation
-        let _ = DelegationManager::delegate_votes(&env, delegator.clone(), delegate.clone());
+        DelegationManager::set_total_voting_power(&env, 1_000_000).unwrap();
 
-        // Delegate revokes their own authority
-        let result = DelegationManager::revoke_delegation(&env, delegator.clone(), delegate.clone());
-        assert!(result.is_ok());
+        // First delegator: 60 000 (under cap).
+        let d1 = Address::generate(&env);
+        DelegationManager::set_delegate(&env, &d1, &delegatee, 60_000).unwrap();
 
-        // Verify it's gone
-        assert!(!DelegationManager::has_delegation(&env, &delegator, &delegate));
+        // Second delegator: 40 000 → total 100 000 (exactly at cap, OK).
+        let d2 = Address::generate(&env);
+        DelegationManager::set_delegate(&env, &d2, &delegatee, 40_000).unwrap();
+        assert_eq!(DelegationManager::get_delegated_power(&env, &delegatee), 100_000);
+
+        // Third delegator: 1 more → over cap, rejected.
+        let d3 = Address::generate(&env);
+        let result = DelegationManager::set_delegate(&env, &d3, &delegatee, 1);
+        assert_eq!(result, Err(Error::DelegationCapExceeded));
     }
 
     #[test]
-    fn test_revocation_history() {
-        let env = Env::default();
+    fn test_redelegate_updates_power() {
+        let env = setup_env();
         let delegator = Address::generate(&env);
-        let delegate = Address::generate(&env);
+        let delegatee_a = Address::generate(&env);
+        let delegatee_b = Address::generate(&env);
 
-        // Create and revoke delegation
-        let _ = DelegationManager::delegate_votes(&env, delegator.clone(), delegate.clone());
-        let _ = DelegationManager::unset_delegate(&env, delegator.clone(), delegate.clone());
+        DelegationManager::set_total_voting_power(&env, 1_000_000).unwrap();
 
-        // Check history
-        let history = DelegationManager::get_revocation_history(&env, &delegator, &delegate)
-            .unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history.get(0).unwrap().revoked_at > 0, true);
+        DelegationManager::set_delegate(&env, &delegator, &delegatee_a, 50_000).unwrap();
+        assert_eq!(DelegationManager::get_delegated_power(&env, &delegatee_a), 50_000);
+
+        // Re-delegate to a different delegatee.
+        DelegationManager::set_delegate(&env, &delegator, &delegatee_b, 30_000).unwrap();
+
+        assert_eq!(DelegationManager::get_delegated_power(&env, &delegatee_a), 0);
+        assert_eq!(DelegationManager::get_delegated_power(&env, &delegatee_b), 30_000);
+        let record = DelegationManager::get_delegation(&env, &delegator).unwrap();
+        assert_eq!(record.delegatee, delegatee_b);
+        assert_eq!(record.amount, 30_000);
+    }
+
+    #[test]
+    fn test_set_delegate_rejects_self_delegation() {
+        let env = setup_env();
+        let delegator = Address::generate(&env);
+
+        DelegationManager::set_total_voting_power(&env, 1_000_000).unwrap();
+
+        let result = DelegationManager::set_delegate(&env, &delegator, &delegator, 50_000);
+        assert_eq!(result, Err(Error::InvalidInput));
+    }
+
+    #[test]
+    fn test_set_delegate_rejects_zero_stake() {
+        let env = setup_env();
+        let delegator = Address::generate(&env);
+        let delegatee = Address::generate(&env);
+
+        DelegationManager::set_total_voting_power(&env, 1_000_000).unwrap();
+
+        let result = DelegationManager::set_delegate(&env, &delegator, &delegatee, 0);
+        assert_eq!(result, Err(Error::InvalidInput));
+    }
+
+    #[test]
+    fn test_unset_delegate_no_active_delegation() {
+        let env = setup_env();
+        let delegator = Address::generate(&env);
+
+        let result = DelegationManager::unset_delegate(&env, &delegator);
+        assert_eq!(result, Err(Error::InvalidInput));
+    }
+
+    #[test]
+    fn test_delegation_cap_zero_total_power() {
+        // When total voting power is 0, the cap is 0 — no delegation allowed.
+        assert_eq!(DelegationManager::delegation_cap(0), 0);
+    }
+
+    #[test]
+    fn test_delegation_cap_calculation() {
+        // 10 % of 1 000 000 = 100 000
+        assert_eq!(DelegationManager::delegation_cap(1_000_000), 100_000);
+        // 10 % of 500 = 50
+        assert_eq!(DelegationManager::delegation_cap(500), 50);
+        // 10 % of 10 = 1
+        assert_eq!(DelegationManager::delegation_cap(10), 1);
+    }
+
+    #[test]
+    fn test_idempotent_same_delegation() {
+        let env = setup_env();
+        let delegator = Address::generate(&env);
+        let delegatee = Address::generate(&env);
+
+        DelegationManager::set_total_voting_power(&env, 1_000_000).unwrap();
+
+        // First call stores the delegation.
+        DelegationManager::set_delegate(&env, &delegator, &delegatee, 50_000).unwrap();
+        assert_eq!(DelegationManager::get_delegated_power(&env, &delegatee), 50_000);
+
+        // Second call with same params is idempotent.
+        DelegationManager::set_delegate(&env, &delegator, &delegatee, 50_000).unwrap();
+        assert_eq!(DelegationManager::get_delegated_power(&env, &delegatee), 50_000);
     }
 }

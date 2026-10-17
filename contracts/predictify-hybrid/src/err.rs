@@ -24,6 +24,9 @@ pub enum Error {
     InvalidCap = 674,
     /// The cool-off period is still active. Cannot unpause/resume the market.
     CoolOffPeriodActive = 675,
+    /// Delegation cap exceeded: a single address cannot hold more than 10 % of
+    /// total voting power through delegation.
+    DelegationCapExceeded = 676,
     // ===== USER OPERATION ERRORS (100-112) =====
     /// User is not authorized to perform the requested action. Typically returned when
     /// a non-admin attempts to call admin-only functions.

@@ -162,11 +162,12 @@ error_code_snapshot! {
     MaxBetCapExceeded = 673,
     InvalidCap = 674,
     CoolOffPeriodActive = 675,
+    DelegationCapExceeded = 676,
 }
 
 #[test]
 fn contract_error_codes_are_stable() {
-    assert_eq!(ERROR_CODE_SNAPSHOT.len(), 131);
+    assert_eq!(ERROR_CODE_SNAPSHOT.len(), 121);
 
     for &(error, expected) in ERROR_CODE_SNAPSHOT {
         assert_eq!(

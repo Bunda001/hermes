@@ -330,6 +330,51 @@ fn test_default_winner_takes_all_payout() {
 }
 
 #[test]
+fn test_winner_takes_all_carries_fractional_payout_remainders() {
+    let te = setup_test_env();
+    let market_id = create_standard_market(&te, 2);
+
+    te.client.place_bet(&te.bettor1, &market_id, &0, &1);
+    te.client.place_bet(&te.bettor2, &market_id, &0, &2);
+    te.client.place_bet(&te.bettor3, &market_id, &1, &2);
+    let resolve_time = te.env.ledger().timestamp() + 86_401;
+    te.env.ledger().set_timestamp(resolve_time);
+    te.client.resolve_market(&te.creator, &market_id, &0);
+
+    assert_eq!(te.client.calculate_payout(&market_id, &te.bettor1), 1);
+    assert_eq!(te.client.calculate_payout(&market_id, &te.bettor2), 3);
+
+    let first_payout = te.client.claim_winnings(&te.bettor1, &market_id);
+    assert_eq!(first_payout, 1);
+    assert_eq!(te.client.calculate_payout(&market_id, &te.bettor2), 4);
+
+    let second_payout = te.client.claim_winnings(&te.bettor2, &market_id);
+    assert_eq!(first_payout + second_payout, 5);
+}
+
+#[test]
+fn test_multiple_winning_outcomes_allocate_split_remainder() {
+    let te = setup_test_env();
+    let market_id = create_standard_market(&te, 3);
+
+    te.client.place_bet(&te.bettor1, &market_id, &0, &1);
+    te.client.place_bet(&te.bettor2, &market_id, &1, &1);
+    te.client.place_bet(&te.bettor3, &market_id, &2, &3);
+
+    let resolve_time = te.env.ledger().timestamp() + 86_401;
+    te.env.ledger().set_timestamp(resolve_time);
+    let winning_outcomes = Vec::from_array(&te.env, [0u32, 1u32]);
+    te.client
+        .resolve_market_with_outcomes(&te.creator, &market_id, &winning_outcomes);
+
+    let first_payout = te.client.claim_winnings(&te.bettor1, &market_id);
+    let second_payout = te.client.claim_winnings(&te.bettor2, &market_id);
+    assert_eq!(first_payout, 3);
+    assert_eq!(second_payout, 2);
+    assert_eq!(first_payout + second_payout, 5);
+}
+
+#[test]
 fn test_tiered_payout_with_runner_up_credit() {
     let te = setup_test_env();
 
