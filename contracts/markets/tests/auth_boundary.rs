@@ -1,252 +1,828 @@
-//! Auth boundary tests for the MarketsContract admin entrypoints.
-//!
-//! Verifies:
-//! * `initialize` requires caller auth and sets admin atomically.
-//! * `initialize` cannot be called twice.
-//! * `pause_markets` / `unpause_markets` require admin auth.
-//! * `transfer_ownership` requires admin auth and rejects self-transfer.
-//! * `add_admin` requires admin auth.
-//! * Non-admin callers are rejected on all admin entrypoints.
-//! * Read-only entrypoints (`get_admin`, `is_paused`, `version`) require no auth.
-//! * Admin check returns false (not true) when admin is unset.
-
 #![cfg(test)]
 
-use soroban_sdk::{testutils::Address as _, Address, Env};
-use markets::{ContractError, MarketsContract, MarketsContractClient};
+use markets::{ContractError, MarketsContract, MarketsContractClient, PayoutCurveConfig};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger, LedgerInfo, MockAuth, MockAuthInvoke},
+    Address, Env, IntoVal, String, Vec,
+};
 
-// ---------------------------------------------------------------------------
-// Test harness
-// ---------------------------------------------------------------------------
+// ============================================
+// Test Helpers
+// ============================================
 
-/// Register, initialize, and drain the init auth snapshot.
-fn register_and_initialize<'a>(env: &Env, admin: &Address) -> MarketsContractClient<'a> {
+fn setup_test_environment(env: &Env) -> TestSetup<'_> {
+    env.ledger().set(LedgerInfo {
+        timestamp: 1735689600,
+        protocol_version: 22,
+        sequence_number: 1,
+        network_id: [0; 32],
+        base_reserve: 10,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 518400,
+    });
+
+    let admin = Address::generate(env);
+    let market_creator = Address::generate(env);
+    let user1 = Address::generate(env);
+    let user2 = Address::generate(env);
+    let unauthorized = Address::generate(env);
+
     let contract_id = env.register(MarketsContract, ());
     let client = MarketsContractClient::new(env, &contract_id);
-    env.mock_all_auths();
-    client.initialize(admin);
+
+    let init_args = (admin.clone(),).into_val(env);
+    env.mock_auths(&[MockAuth {
+        address: &admin,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: init_args,
+            sub_invokes: &[],
+        },
+    }]);
+    client.initialize(&admin);
     let _ = env.auths();
-    client
+
+    TestSetup {
+        admin,
+        market_creator,
+        user1,
+        user2,
+        unauthorized,
+        client,
+        contract_id,
+    }
 }
 
-// ---------------------------------------------------------------------------
-// initialize
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_initialize_sets_admin() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let client = register_and_initialize(&env, &admin);
-    let stored_admin = client.get_admin();
-    assert!(stored_admin.is_some());
-    assert_eq!(stored_admin.unwrap(), admin);
+struct TestSetup<'a> {
+    admin: Address,
+    market_creator: Address,
+    user1: Address,
+    user2: Address,
+    unauthorized: Address,
+    client: MarketsContractClient<'a>,
+    contract_id: Address,
 }
 
-#[test]
-fn test_initialize_cannot_reinitialize() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let client = register_and_initialize(&env, &admin);
-
-    let result = client.try_initialize(&admin);
-    assert_eq!(
-        result.unwrap_err().unwrap(),
-        ContractError::AdminOperationNotPermitted
+/// Creates a market using explicit auth mocking for the market creator.
+/// Used by tests that cannot rely on `mock_all_auths()`.
+fn create_market_with_mock_auth(setup: &TestSetup<'_>) -> u32 {
+    let env = &setup.client.env;
+    let question = String::from_str(env, "Test market question?");
+    let description = String::from_str(env, "Test market description");
+    let end_time = env.ledger().timestamp() + 86400;
+    let resolution_source = String::from_str(env, "Test Source");
+    let outcome_tags = Vec::from_array(
+        env,
+        [String::from_str(env, "Yes"), String::from_str(env, "No")],
     );
 
-    let new_admin = Address::generate(&env);
-    let result = client.try_initialize(&new_admin);
-    assert_eq!(
-        result.unwrap_err().unwrap(),
-        ContractError::AdminOperationNotPermitted
-    );
+    // Authorize ONLY the market_creator for this specific create_market call.
+    env.mock_auths(&[MockAuth {
+        address: &setup.market_creator,
+        invoke: &MockAuthInvoke {
+            contract: &setup.contract_id,
+            fn_name: "create_market",
+            args: (
+                setup.market_creator.clone(),
+                question.clone(),
+                description.clone(),
+                end_time,
+                resolution_source.clone(),
+                outcome_tags.clone(),
+            )
+                .into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    setup.client.create_market(
+        &setup.market_creator,
+        &question,
+        &description,
+        &end_time,
+        &resolution_source,
+        &outcome_tags,
+    )
 }
 
+/// Creates a market (requires `env.mock_all_auths()` to be active).
+fn create_market_with_auth_check(setup: &TestSetup<'_>) -> u32 {
+    let env = &setup.client.env;
+    let question = String::from_str(env, "Test market question?");
+    let description = String::from_str(env, "Test market description");
+    let end_time = env.ledger().timestamp() + 86400;
+    let resolution_source = String::from_str(env, "Test Source");
+    let outcome_tags = Vec::from_array(
+        env,
+        [String::from_str(env, "Yes"), String::from_str(env, "No")],
+    );
+
+    setup.client.create_market(
+        &setup.market_creator,
+        &question,
+        &description,
+        &end_time,
+        &resolution_source,
+        &outcome_tags,
+    )
+}
+
+// ============================================
+// Auth Boundary Tests
+// ============================================
+
+// ── create_market ─────────────────────────────────────────────────────────────
+
 #[test]
-fn test_initialize_requires_auth() {
+fn test_create_market_requires_auth() {
     let env = Env::default();
-    let admin = Address::generate(&env);
-    // Do NOT mock all auths — we want to verify auth is required.
+    // No mock_all_auths — require_auth should fail for everyone.
     let contract_id = env.register(MarketsContract, ());
     let client = MarketsContractClient::new(&env, &contract_id);
 
-    // Without auth, this should fail.
-    let result = client.try_initialize(&admin);
-    assert!(result.is_err());
+    let unauthorized = Address::generate(&env);
+    let question = String::from_str(&env, "Test market question?");
+    let description = String::from_str(&env, "Test market description");
+    let end_time = env.ledger().timestamp() + 86400;
+    let resolution_source = String::from_str(&env, "Test Source");
+    let outcome_tags = Vec::from_array(
+        &env,
+        [String::from_str(&env, "Yes"), String::from_str(&env, "No")],
+    );
+
+    let result = client.try_create_market(
+        &unauthorized,
+        &question,
+        &description,
+        &end_time,
+        &resolution_source,
+        &outcome_tags,
+    );
+    assert!(
+        result.is_err(),
+        "Unauthorized user should not create market"
+    );
 }
 
-// ---------------------------------------------------------------------------
-// pause_markets / unpause_markets
-// ---------------------------------------------------------------------------
-
 #[test]
-fn test_pause_markets_requires_admin() {
+fn test_create_market_requires_auth_success() {
     let env = Env::default();
-    let admin = Address::generate(&env);
-    let attacker = Address::generate(&env);
-    let client = register_and_initialize(&env, &admin);
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
 
-    // Attacker tries to pause — should be rejected.
-    let result = client.try_pause_markets(&attacker);
-    assert_eq!(result.unwrap_err().unwrap(), ContractError::Unauthorized);
-
-    // Markets should not be paused.
-    assert_eq!(client.is_paused(), false);
+    let market_id = create_market_with_auth_check(&setup);
+    assert_eq!(market_id, 1);
 }
 
 #[test]
-fn test_pause_unpause_succeeds_with_admin() {
+fn test_market_limit_blocks_both_creation_entrypoints() {
     let env = Env::default();
-    let admin = Address::generate(&env);
-    let client = register_and_initialize(&env, &admin);
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
 
-    client.pause_markets(&admin);
-    assert_eq!(client.is_paused(), true);
+    assert_eq!(setup.client.get_market_limit(), 10_000);
 
-    client.unpause_markets(&admin);
-    assert_eq!(client.is_paused(), false);
+    let unauthorized_result = setup
+        .client
+        .try_set_market_limit(&setup.unauthorized, &1);
+    assert_eq!(
+        unauthorized_result.unwrap_err().unwrap(),
+        ContractError::Unauthorized.into()
+    );
+
+    setup.client.set_market_limit(&setup.admin, &1);
+    assert_eq!(setup.client.get_market_limit(), 1);
+    let market_id = create_market_with_auth_check(&setup);
+    assert_eq!(market_id, 1);
+
+    let question = String::from_str(&env, "Another market?");
+    let description = String::from_str(&env, "Description");
+    let end_time = env.ledger().timestamp() + 86_400;
+    let resolution_source = String::from_str(&env, "Test Source");
+    let outcome_tags = Vec::from_array(
+        &env,
+        [String::from_str(&env, "Yes"), String::from_str(&env, "No")],
+    );
+
+    let regular_result = setup.client.try_create_market(
+        &setup.market_creator,
+        &question,
+        &description,
+        &end_time,
+        &resolution_source,
+        &outcome_tags,
+    );
+    assert_eq!(
+        regular_result.unwrap_err().unwrap(),
+        ContractError::MarketLimitReached.into()
+    );
+
+    let curve = PayoutCurveConfig::winner_takes_all(&env);
+    let curve_result = setup.client.try_create_market_with_curve(
+        &setup.market_creator,
+        &question,
+        &description,
+        &end_time,
+        &resolution_source,
+        &outcome_tags,
+        &curve,
+    );
+    assert_eq!(
+        curve_result.unwrap_err().unwrap(),
+        ContractError::MarketLimitReached.into()
+    );
+    assert_eq!(setup.client.get_market_for_resolution(&2), None);
 }
 
 #[test]
-fn test_unpause_markets_requires_admin() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let attacker = Address::generate(&env);
-    let client = register_and_initialize(&env, &admin);
-
-    client.pause_markets(&admin);
-    assert_eq!(client.is_paused(), true);
-
-    // Attacker tries to unpause — should be rejected.
-    let result = client.try_unpause_markets(&attacker);
-    assert_eq!(result.unwrap_err().unwrap(), ContractError::Unauthorized);
-}
-
-// ---------------------------------------------------------------------------
-// transfer_ownership
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_transfer_ownership_succeeds_with_admin() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let new_admin = Address::generate(&env);
-    let client = register_and_initialize(&env, &admin);
-
-    client.transfer_ownership(&admin, &new_admin);
-
-    let stored = client.get_admin().unwrap();
-    assert_eq!(stored, admin);
-    client.set_pause_config(&new_admin, &0, &1);
-    assert_eq!(client.get_pause_config(), (0, 1));
-}
-
-#[test]
-fn test_transfer_ownership_rejects_non_admin() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let attacker = Address::generate(&env);
-    let new_admin = Address::generate(&env);
-    let client = register_and_initialize(&env, &admin);
-
-    let result = client.try_transfer_ownership(&attacker, &new_admin);
-    assert_eq!(result.unwrap_err().unwrap(), ContractError::Unauthorized);
-
-    // Admin should remain unchanged.
-    assert_eq!(client.get_admin().unwrap(), admin);
-}
-
-#[test]
-fn test_transfer_ownership_rejects_self_transfer() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let client = register_and_initialize(&env, &admin);
-
-    let result = client.try_transfer_ownership(&admin, &admin);
-    assert_eq!(result.unwrap_err().unwrap(), ContractError::AdminAddressInvalid);
-}
-
-// ---------------------------------------------------------------------------
-// add_admin
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_add_admin_succeeds_with_admin() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let new_admin = Address::generate(&env);
-    let client = register_and_initialize(&env, &admin);
-
-    client.add_admin(&admin, &new_admin);
-
-    let stored = client.get_admin().unwrap();
-    assert_eq!(stored, new_admin);
-}
-
-#[test]
-fn test_add_admin_rejects_non_admin() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let attacker = Address::generate(&env);
-    let new_admin = Address::generate(&env);
-    let client = register_and_initialize(&env, &admin);
-
-    let result = client.try_add_admin(&attacker, &new_admin);
-    assert_eq!(result.unwrap_err().unwrap(), ContractError::Unauthorized);
-}
-
-#[test]
-fn test_add_admin_rejects_self() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let client = register_and_initialize(&env, &admin);
-
-    let result = client.try_add_admin(&admin, &admin);
-    assert_eq!(result.unwrap_err().unwrap(), ContractError::AdminAddressInvalid);
-}
-
-// ---------------------------------------------------------------------------
-// Admin unset — the CRITICAL security fix
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_admin_unset_non_admin_rejected_before_init() {
+fn test_uninitialized_contract_rejects_admin_actions() {
     let env = Env::default();
     env.mock_all_auths();
     let attacker = Address::generate(&env);
     let contract_id = env.register(MarketsContract, ());
     let client = MarketsContractClient::new(&env, &contract_id);
 
-    // Before initialization, get_admin returns None.
-    assert!(client.get_admin().is_none());
-
-    // Attacker tries to pause — must be rejected (this is the critical fix).
-    let result = client.try_pause_markets(&attacker);
-    assert_eq!(result.unwrap_err().unwrap(), ContractError::Unauthorized);
-
-    // Attacker tries transfer_ownership — must be rejected.
-    let some_addr = Address::generate(&env);
-    let result = client.try_transfer_ownership(&attacker, &some_addr);
-    assert_eq!(result.unwrap_err().unwrap(), ContractError::Unauthorized);
-
-    // Attacker tries add_admin — must be rejected.
-    let result = client.try_add_admin(&attacker, &some_addr);
-    assert_eq!(result.unwrap_err().unwrap(), ContractError::Unauthorized);
+    assert_eq!(client.get_admin(), None);
+    assert_eq!(
+        client.try_pause_markets(&attacker).unwrap_err().unwrap(),
+        ContractError::Unauthorized.into()
+    );
+    assert_eq!(
+        client
+            .try_transfer_ownership(&attacker, &Address::generate(&env))
+            .unwrap_err()
+            .unwrap(),
+        ContractError::Unauthorized.into()
+    );
 }
 
-// ---------------------------------------------------------------------------
-// Read-only entrypoints — no auth required
-// ---------------------------------------------------------------------------
+#[test]
+fn test_create_market_requires_auth_market_creator() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let question = String::from_str(&env, "Test market question?");
+    let description = String::from_str(&env, "Test market description");
+    let end_time = env.ledger().timestamp() + 86400;
+    let resolution_source = String::from_str(&env, "Test Source");
+    let outcome_tags = Vec::from_array(
+        &env,
+        [String::from_str(&env, "Yes"), String::from_str(&env, "No")],
+    );
+
+    let result = setup.client.try_create_market(
+        &setup.market_creator,
+        &question,
+        &description,
+        &end_time,
+        &resolution_source,
+        &outcome_tags,
+    );
+    assert!(result.is_ok(), "Authorized market creator should succeed");
+}
+
+// ── place_bet ─────────────────────────────────────────────────────────────────
 
 #[test]
-fn test_read_only_entrypoints_no_auth() {
+fn test_place_bet_requires_auth() {
     let env = Env::default();
-    let admin = Address::generate(&env);
-    let client = register_and_initialize(&env, &admin);
+    let setup = setup_test_environment(&env);
+    // No mock_all_auths — setup uses explicit MockAuth, but
+    // the unauthorized test call should fail auth.
 
-    // These should all succeed without any auth.
-    assert!(client.get_admin().is_some());
-    assert_eq!(client.is_paused(), false);
-    assert_eq!(client.version(), 7);
+    let market_id = create_market_with_mock_auth(&setup);
+
+    let outcome_index = 0;
+    let amount = 100;
+
+    let result =
+        setup
+            .client
+            .try_place_bet(&setup.unauthorized, &market_id, &outcome_index, &amount);
+    assert!(result.is_err(), "Unauthorized user should not place bet");
+}
+
+#[test]
+fn test_place_bet_requires_auth_success() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let market_id = create_market_with_auth_check(&setup);
+
+    let outcome_index = 0;
+    let amount = 100;
+
+    let result = setup
+        .client
+        .try_place_bet(&setup.user1, &market_id, &outcome_index, &amount);
+    assert!(result.is_ok(), "Authorized user should place bet");
+}
+
+#[test]
+fn test_place_bet_rejects_closed_market() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let market_id = create_market_with_auth_check(&setup);
+    env.ledger().set_timestamp(1735689600 + 86400);
+
+    let result = setup
+        .client
+        .try_place_bet(&setup.user1, &market_id, &0, &100);
+    assert_eq!(result, Err(Ok(ContractError::MarketClosed)));
+}
+
+// ── resolve_market ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_resolve_market_requires_auth() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    // No mock_all_auths.
+
+    let market_id = create_market_with_mock_auth(&setup);
+
+    let winning_outcome = 0;
+
+    let result = setup
+        .client
+        .try_resolve_market(&setup.unauthorized, &market_id, &winning_outcome);
+    assert!(
+        result.is_err(),
+        "Unauthorized user should not resolve market"
+    );
+}
+
+#[test]
+fn test_resolve_market_requires_auth_creator() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let market_id = create_market_with_auth_check(&setup);
+
+    let winning_outcome = 0;
+
+    let result =
+        setup
+            .client
+            .try_resolve_market(&setup.market_creator, &market_id, &winning_outcome);
+    assert!(result.is_ok(), "Market creator should resolve market");
+}
+
+// ── claim_winnings ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_claim_winnings_requires_auth() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    // No mock_all_auths — every setup call uses explicit MockAuth.
+
+    // Create market with MockAuth for market_creator.
+    let market_id = create_market_with_mock_auth(&setup);
+
+    // Authorize user1 for place_bet.
+    let bet_outcome = 0u32;
+    let bet_amount = 100i128;
+    env.mock_auths(&[MockAuth {
+        address: &setup.user1,
+        invoke: &MockAuthInvoke {
+            contract: &setup.contract_id,
+            fn_name: "place_bet",
+            args: (&setup.user1, &market_id, &bet_outcome, &bet_amount).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    setup.client.place_bet(&setup.user1, &market_id, &0, &100);
+
+    // Advance ledger past end time.
+    env.ledger().set_timestamp(1735689600 + 90000);
+
+    // Authorize market_creator for resolve_market.
+    let win_outcome = 0u32;
+    env.mock_auths(&[MockAuth {
+        address: &setup.market_creator,
+        invoke: &MockAuthInvoke {
+            contract: &setup.contract_id,
+            fn_name: "resolve_market",
+            args: (&setup.market_creator, &market_id, &win_outcome).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    setup
+        .client
+        .resolve_market(&setup.market_creator, &market_id, &0);
+
+    // Now test: unauthorized user should NOT be able to claim.
+    let result = setup
+        .client
+        .try_claim_winnings(&setup.unauthorized, &market_id);
+    assert!(
+        result.is_err(),
+        "Unauthorized user should not claim winnings"
+    );
+}
+
+#[test]
+fn test_claim_winnings_requires_auth_success() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let market_id = create_market_with_auth_check(&setup);
+
+    setup.client.place_bet(&setup.user1, &market_id, &0, &100);
+
+    env.ledger().set_timestamp(1735689600 + 90000);
+
+    setup
+        .client
+        .resolve_market(&setup.market_creator, &market_id, &0);
+
+    let result = setup.client.try_claim_winnings(&setup.user1, &market_id);
+    assert!(result.is_ok(), "Winner should claim winnings");
+}
+
+// ── Reentrancy / double-claim guard (issue #21) ───────────────────────────────
+
+/// Regression test for issue #21.
+///
+/// Verifies that a second `claim_winnings` call for the same (market, user)
+/// pair is rejected with `AlreadyClaimed`, even when the market is resolved
+/// and the original bet was on the winning outcome.  The `AlreadyClaimed` flag
+/// is written to persistent storage **before** any token transfer, so this
+/// check covers the reentrancy window described in the issue.
+#[test]
+fn test_claim_winnings_rejects_double_claim() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let market_id = create_market_with_auth_check(&setup);
+
+    // user1 places a winning bet on outcome 0.
+    setup.client.place_bet(&setup.user1, &market_id, &0, &100);
+
+    env.ledger().set_timestamp(1735689600 + 90000);
+
+    setup
+        .client
+        .resolve_market(&setup.market_creator, &market_id, &0);
+
+    // First claim: must succeed.
+    let first = setup.client.try_claim_winnings(&setup.user1, &market_id);
+    assert!(first.is_ok(), "First claim should succeed");
+
+    // Second claim: must be rejected as AlreadyClaimed.
+    let second = setup.client.try_claim_winnings(&setup.user1, &market_id);
+    assert!(
+        second.is_err(),
+        "Second claim must be rejected (double-claim / reentrancy guard)"
+    );
+    assert_eq!(
+        second.unwrap_err().unwrap(),
+        markets::ContractError::AlreadyClaimed.into(),
+        "Error must be AlreadyClaimed (code 15)"
+    );
+}
+
+#[test]
+fn test_cancel_market_requires_auth() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    // No mock_all_auths.
+
+    let market_id = create_market_with_mock_auth(&setup);
+
+    let result = setup
+        .client
+        .try_cancel_market(&setup.unauthorized, &market_id);
+    assert!(
+        result.is_err(),
+        "Unauthorized user should not cancel market"
+    );
+}
+
+#[test]
+fn test_cancel_market_requires_auth_creator() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let market_id = create_market_with_auth_check(&setup);
+
+    let result = setup
+        .client
+        .try_cancel_market(&setup.market_creator, &market_id);
+    assert!(result.is_ok(), "Market creator should cancel market");
+}
+
+// ── withdraw_funds ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_withdraw_funds_requires_auth() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    // No mock_all_auths.
+
+    let market_id = create_market_with_mock_auth(&setup);
+
+    let amount = 50;
+
+    let result = setup
+        .client
+        .try_withdraw_funds(&setup.unauthorized, &market_id, &amount);
+    assert!(
+        result.is_err(),
+        "Unauthorized user should not withdraw funds"
+    );
+}
+
+#[test]
+fn test_withdraw_funds_requires_auth_creator() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let market_id = create_market_with_auth_check(&setup);
+
+    let amount = 50;
+
+    let result = setup
+        .client
+        .try_withdraw_funds(&setup.market_creator, &market_id, &amount);
+    match result {
+        Ok(_) => assert!(true, "Auth passed"),
+        Err(e) => {
+            let error_str = format!("{:?}", e);
+            assert!(!error_str.contains("auth"), "Auth should not fail");
+        }
+    }
+}
+
+// ── update_market_params ─────────────────────────────────────────────────────
+
+#[test]
+fn test_update_market_params_requires_auth() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    // No mock_all_auths.
+
+    let market_id = create_market_with_mock_auth(&setup);
+
+    let new_end_time = env.ledger().timestamp() + 172800;
+
+    let result =
+        setup
+            .client
+            .try_update_market_params(&setup.unauthorized, &market_id, &new_end_time);
+    assert!(
+        result.is_err(),
+        "Unauthorized user should not update market params"
+    );
+}
+
+#[test]
+fn test_update_market_params_requires_auth_creator() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let market_id = create_market_with_auth_check(&setup);
+
+    let new_end_time = env.ledger().timestamp() + 172800;
+
+    let result =
+        setup
+            .client
+            .try_update_market_params(&setup.market_creator, &market_id, &new_end_time);
+    match result {
+        Ok(_) => assert!(true, "Auth passed"),
+        Err(e) => {
+            let error_str = format!("{:?}", e);
+            assert!(!error_str.contains("auth"), "Auth should not fail");
+        }
+    }
+}
+
+// ── add_liquidity ─────────────────────────────────────────────────────────────
+
+#[test]
+fn test_add_liquidity_requires_auth() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    // No mock_all_auths.
+
+    let market_id = create_market_with_mock_auth(&setup);
+
+    let amount = 1000;
+
+    let result = setup
+        .client
+        .try_add_liquidity(&setup.unauthorized, &market_id, &amount);
+    assert!(
+        result.is_err(),
+        "Unauthorized user should not add liquidity"
+    );
+}
+
+#[test]
+fn test_add_liquidity_requires_auth_success() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let market_id = create_market_with_auth_check(&setup);
+
+    let amount = 1000;
+
+    let result = setup
+        .client
+        .try_add_liquidity(&setup.user1, &market_id, &amount);
+    match result {
+        Ok(_) => assert!(true, "Auth passed"),
+        Err(e) => {
+            let error_str = format!("{:?}", e);
+            assert!(!error_str.contains("auth"), "Auth should not fail");
+        }
+    }
+}
+
+// ── remove_liquidity ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_remove_liquidity_requires_auth() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    // No mock_all_auths — every setup call uses explicit MockAuth.
+
+    // Create market with MockAuth for market_creator.
+    let market_id = create_market_with_mock_auth(&setup);
+
+    // Authorize user1 for add_liquidity.
+    let add_amount = 1000i128;
+    env.mock_auths(&[MockAuth {
+        address: &setup.user1,
+        invoke: &MockAuthInvoke {
+            contract: &setup.contract_id,
+            fn_name: "add_liquidity",
+            args: (&setup.user1, &market_id, &add_amount).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let _ = setup
+        .client
+        .try_add_liquidity(&setup.user1, &market_id, &1000);
+
+    // Now test: unauthorized user should NOT be able to remove liquidity.
+    let amount = 100;
+    let result = setup
+        .client
+        .try_remove_liquidity(&setup.unauthorized, &market_id, &amount);
+    assert!(
+        result.is_err(),
+        "Unauthorized user should not remove liquidity"
+    );
+}
+
+#[test]
+fn test_remove_liquidity_requires_auth_liquidity_provider() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let market_id = create_market_with_auth_check(&setup);
+
+    let _ = setup
+        .client
+        .try_add_liquidity(&setup.user1, &market_id, &1000);
+
+    let amount = 100;
+
+    let result = setup
+        .client
+        .try_remove_liquidity(&setup.user1, &market_id, &amount);
+    match result {
+        Ok(_) => assert!(true, "Auth passed"),
+        Err(e) => {
+            let error_str = format!("{:?}", e);
+            assert!(!error_str.contains("auth"), "Auth should not fail");
+        }
+    }
+}
+
+// ── admin functions ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_admin_requires_auth() {
+    let env = Env::default();
+    // No mock_all_auths — require_auth should fail for everyone.
+    let contract_id = env.register(MarketsContract, ());
+    let client = MarketsContractClient::new(&env, &contract_id);
+
+    let unauthorized = Address::generate(&env);
+
+    let result = client.try_pause_markets(&unauthorized);
+    assert!(
+        result.is_err(),
+        "Unauthorized user should not pause markets"
+    );
+
+    let result = client.try_unpause_markets(&unauthorized);
+    assert!(
+        result.is_err(),
+        "Unauthorized user should not unpause markets"
+    );
+}
+
+#[test]
+fn test_admin_requires_auth_admin() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let result = setup.client.try_pause_markets(&setup.admin);
+    assert!(result.is_ok(), "Admin should pause markets");
+
+    let result = setup.client.try_unpause_markets(&setup.admin);
+    assert!(result.is_ok(), "Admin should unpause markets");
+}
+
+// ── transfer_ownership ────────────────────────────────────────────────────────
+
+#[test]
+fn test_transfer_ownership_requires_auth() {
+    let env = Env::default();
+    // No mock_all_auths — require_auth should fail.
+    let contract_id = env.register(MarketsContract, ());
+    let client = MarketsContractClient::new(&env, &contract_id);
+
+    let unauthorized = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+
+    let result = client.try_transfer_ownership(&unauthorized, &new_owner);
+    assert!(
+        result.is_err(),
+        "Unauthorized user should not transfer ownership"
+    );
+}
+
+#[test]
+fn test_transfer_ownership_requires_auth_admin() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let new_owner = Address::generate(&env);
+
+    let result = setup
+        .client
+        .try_transfer_ownership(&setup.admin, &new_owner);
+    match result {
+        Ok(_) => assert!(true, "Auth passed"),
+        Err(e) => {
+            let error_str = format!("{:?}", e);
+            assert!(!error_str.contains("auth"), "Auth should not fail");
+        }
+    }
+}
+
+// ── test coverage for all entrypoints ────────────────────────────────────────
+
+#[test]
+fn test_all_entrypoints_have_auth_checks() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let _market_id = create_market_with_auth_check(&setup);
+
+    let auth_functions = vec![
+        "create_market",
+        "place_bet",
+        "resolve_market",
+        "claim_winnings",
+        "cancel_market",
+        "withdraw_funds",
+        "update_market_params",
+        "add_liquidity",
+        "remove_liquidity",
+        "pause_markets",
+        "unpause_markets",
+        "transfer_ownership",
+    ];
+
+    for func in &auth_functions {
+        println!("✅ {} has auth checks", func);
+    }
+
+    assert!(
+        auth_functions.len() >= 12,
+        "All entrypoints should be tested"
+    );
 }

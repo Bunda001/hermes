@@ -233,6 +233,7 @@ fn test_capacity_limits() {
         client.try_record_metric_at(&metric, &40, &400),
         Err(Ok(ContractError::StoreFull))
     );
+    assert_eq!(client.get_metric_summary(&metric).total_count, 3);
 }
 
 #[test]

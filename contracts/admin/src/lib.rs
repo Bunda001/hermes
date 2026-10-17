@@ -21,7 +21,10 @@ pub enum ContractError {
     AdminNotSet = 2,
     Unauthorized = 3,
     AdminActionTimelocked = 4,
+    InvalidCooldown = 5,
 }
+
+const MIN_COOLDOWN_SECONDS: u64 = 60;
 
 #[contract]
 pub struct AdminContract;
@@ -62,7 +65,31 @@ impl AdminContract {
             return Err(ContractError::Unauthorized);
         }
 
+        if seconds < MIN_COOLDOWN_SECONDS {
+            return Err(ContractError::InvalidCooldown);
+        }
+
         env.storage().persistent().set(&DataKey::AdminCooldownSeconds, &seconds);
+        Ok(())
+    }
+
+    /// Explicitly disable admin action cooldown enforcement.
+    pub fn disable_admin_cooldown(env: Env, admin: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(ContractError::AdminNotSet)?;
+
+        if admin != stored_admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AdminCooldownSeconds, &0u64);
         Ok(())
     }
 

@@ -198,6 +198,51 @@ fn rejects_unauthorized_admin_call() {
         fixture.client().try_set_admin_cooldown(&stranger, &100),
         Err(Ok(ContractError::Unauthorized))
     );
+    assert_eq!(
+        fixture.client().try_disable_admin_cooldown(&stranger),
+        Err(Ok(ContractError::Unauthorized))
+    );
+}
+
+#[test]
+fn rejects_cooldowns_below_minimum() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+
+    assert_eq!(
+        fixture
+            .client()
+            .try_set_admin_cooldown(&fixture.admin, &0),
+        Err(Ok(ContractError::InvalidCooldown))
+    );
+    assert_eq!(
+        fixture
+            .client()
+            .try_set_admin_cooldown(&fixture.admin, &59),
+        Err(Ok(ContractError::InvalidCooldown))
+    );
+}
+
+#[test]
+fn disable_admin_cooldown_is_explicit() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    let client = fixture.client();
+    let function_name = Symbol::new(&fixture.env, "test_action");
+
+    fixture.env.ledger().with_mut(|ledger| {
+        ledger.timestamp = 100;
+    });
+    client.set_admin_cooldown(&fixture.admin, &300);
+    assert!(client
+        .check_admin_cooldown(&fixture.admin, &function_name)
+        .is_ok());
+
+    client.disable_admin_cooldown(&fixture.admin);
+    assert_eq!(client.get_admin_cooldown(), 0);
+    assert!(client
+        .check_admin_cooldown(&fixture.admin, &function_name)
+        .is_ok());
 }
 
 #[test]

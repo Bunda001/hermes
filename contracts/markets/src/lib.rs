@@ -23,6 +23,8 @@
 //! | `remove_liquidity`          | Liquidity provider         |
 //! | `pause_markets`             | Admin                      |
 //! | `unpause_markets`           | Admin                      |
+//! | `set_market_limit`          | Admin                      |
+//! | `get_market_limit`          | Anyone (read-only)          |
 //! | `propose_pause`             | Admin                      |
 //! | `approve_pause`             | Admin                      |
 //! | `execute_pause`             | Admin                      |
@@ -49,12 +51,16 @@ pub use errors::ContractError;
 /// Type alias used by generated client code and test harnesses.
 pub type Error = ContractError;
 
+const DEFAULT_MAX_MARKET_COUNT: u32 = 10_000;
+
 /// Persistent-storage keys used by the Markets contract.
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     /// Sequential counter for generating unique market IDs.
     MarketCounter,
+    /// Maximum number of markets allowed.
+    MarketLimit,
     /// Market data keyed by the numeric market ID.
     Market(u32),
     /// Bet placed by a user on a specific market.
@@ -63,8 +69,6 @@ pub enum DataKey {
     Paused,
     /// The primary admin / owner address.
     Admin,
-    /// Whether the contract has been initialized.
-    Initialized,
     /// Whether the contract has been initialized.
     Initialized,
     /// List of additional authorized admin addresses.
@@ -83,6 +87,8 @@ pub enum DataKey {
     /// Written **before** any token transfer in `claim_winnings` to uphold the
     /// checks-effects-interactions pattern and prevent reentrancy double-claims.
     ClaimedBet(u32, Address),
+    /// Fractional payout numerator carried forward per outcome.
+    PayoutRemainder(u32, u32),
     /// Winning outcome indices recorded when a market is resolved.
     WinningOutcomes(u32),
 
@@ -451,14 +457,80 @@ impl MarketsContract {
             .set(&DataKey::LiquidityRewardIndex(market_id), &updated_index);
     }
 
-    fn calculate_gross_payout(env: Env, market_id: u32, claimant: Address) -> i128 {
+    fn scaled_weight_boundary(env: &Env, total_pool: i128, cumulative_weight: u32) -> i128 {
+        let whole = total_pool / 10_000;
+        let fraction = total_pool % 10_000;
+        let whole_share = match whole.checked_mul(cumulative_weight as i128) {
+            Some(value) => value,
+            None => panic_with_error!(env, ContractError::Overflow),
+        };
+        whole_share + (fraction * cumulative_weight as i128) / 10_000
+    }
+
+    fn custom_outcome_share(
+        env: &Env,
+        total_pool: i128,
+        curve: &PayoutCurveConfig,
+        outcome_index: u32,
+    ) -> i128 {
+        let mut cumulative_weight = 0u32;
+        let mut index = 0u32;
+        for weight in curve.custom_weights.iter() {
+            if index == outcome_index {
+                let next_weight = match cumulative_weight.checked_add(weight) {
+                    Some(value) => value,
+                    None => panic_with_error!(env, ContractError::InvalidPayoutCurve),
+                };
+                return Self::scaled_weight_boundary(env, total_pool, next_weight)
+                    - Self::scaled_weight_boundary(env, total_pool, cumulative_weight);
+            }
+            cumulative_weight = match cumulative_weight.checked_add(weight) {
+                Some(value) => value,
+                None => panic_with_error!(env, ContractError::InvalidPayoutCurve),
+            };
+            index += 1;
+        }
+        0
+    }
+
+    fn proportional_payout(
+        env: &Env,
+        market_id: u32,
+        outcome_index: u32,
+        stake: i128,
+        outcome_share: i128,
+        outcome_pool: i128,
+    ) -> (i128, Option<(u32, i128)>) {
+        if outcome_pool <= 0 {
+            return (0, None);
+        }
+
+        let key = DataKey::PayoutRemainder(market_id, outcome_index);
+        let remainder: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let numerator = match stake
+            .checked_mul(outcome_share)
+            .and_then(|value| value.checked_add(remainder))
+        {
+            Some(value) => value,
+            None => panic_with_error!(env, ContractError::Overflow),
+        };
+        (
+            numerator / outcome_pool,
+            Some((outcome_index, numerator % outcome_pool)),
+        )
+    }
+
+    fn calculate_payout_with_remainder(
+        env: Env,
+        market_id: u32,
+        claimant: Address,
+    ) -> (i128, Option<(u32, i128)>) {
         let market: MarketData = match env.storage().persistent().get(&DataKey::Market(market_id)) {
             Some(m) => m,
-            None => return 0,
+            None => return (0, None),
         };
-
         if !market.resolved {
-            return 0;
+            return (0, None);
         }
 
         let bet: BetData = match env
@@ -467,7 +539,7 @@ impl MarketsContract {
             .get(&DataKey::Bet(market_id, claimant))
         {
             Some(b) => b,
-            None => return 0,
+            None => return (0, None),
         };
 
         let curve: PayoutCurveConfig = env
@@ -475,23 +547,21 @@ impl MarketsContract {
             .persistent()
             .get(&DataKey::MarketPayoutCurve(market_id))
             .unwrap_or_else(|| PayoutCurveConfig::winner_takes_all(&env));
-
         let total_pool: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::MarketTotalPool(market_id))
             .unwrap_or(bet.amount);
-
         let win_pool: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::OutcomePool(market_id, market.winning_outcome))
             .unwrap_or(0);
-
         let winning_outcomes = Self::winning_outcomes(&env, market_id, &market);
+
         if winning_outcomes.len() > 1 {
             if !winning_outcomes.contains(bet.outcome_index) {
-                return 0;
+                return (0, None);
             }
             let outcome_pool: i128 = env
                 .storage()
@@ -499,25 +569,46 @@ impl MarketsContract {
                 .get(&DataKey::OutcomePool(market_id, bet.outcome_index))
                 .unwrap_or(0);
             if outcome_pool == 0 {
-                return bet.amount;
+                return (bet.amount, None);
             }
-            let per_outcome_pool = total_pool / winning_outcomes.len() as i128;
-            let weighted_pool = match bet.amount.checked_mul(per_outcome_pool) {
-                Some(value) => value,
-                None => panic_with_error!(env, ContractError::Overflow),
-            };
-            return weighted_pool / outcome_pool;
+
+            let winner_count = winning_outcomes.len() as i128;
+            let mut rank = 0i128;
+            for outcome in winning_outcomes.iter() {
+                if outcome == bet.outcome_index {
+                    break;
+                }
+                rank += 1;
+            }
+            let base_share = total_pool / winner_count;
+            let extra_units = total_pool % winner_count;
+            let outcome_share = base_share + if rank < extra_units { 1 } else { 0 };
+            return Self::proportional_payout(
+                &env,
+                market_id,
+                bet.outcome_index,
+                bet.amount,
+                outcome_share,
+                outcome_pool,
+            );
         }
 
         match curve.curve_type {
             PayoutCurveConfig::WINNER_TAKES_ALL => {
                 if bet.outcome_index != market.winning_outcome {
-                    return 0;
+                    return (0, None);
                 }
                 if win_pool == 0 {
-                    return bet.amount;
+                    return (bet.amount, None);
                 }
-                (bet.amount * total_pool) / win_pool
+                Self::proportional_payout(
+                    &env,
+                    market_id,
+                    bet.outcome_index,
+                    bet.amount,
+                    total_pool,
+                    win_pool,
+                )
             }
             PayoutCurveConfig::TIERED => {
                 let ru_pool: i128 = env
@@ -529,35 +620,63 @@ impl MarketsContract {
                 if ru_pool == 0 {
                     if bet.outcome_index == market.winning_outcome {
                         if win_pool == 0 {
-                            return bet.amount;
+                            return (bet.amount, None);
                         }
-                        return (bet.amount * total_pool) / win_pool;
+                        return Self::proportional_payout(
+                            &env,
+                            market_id,
+                            bet.outcome_index,
+                            bet.amount,
+                            total_pool,
+                            win_pool,
+                        );
                     }
-                    return 0;
+                    return (0, None);
                 }
 
                 if win_pool == 0 {
                     if bet.outcome_index == curve.runner_up_outcome {
-                        return (bet.amount * total_pool) / ru_pool;
+                        return Self::proportional_payout(
+                            &env,
+                            market_id,
+                            bet.outcome_index,
+                            bet.amount,
+                            total_pool,
+                            ru_pool,
+                        );
                     }
-                    return 0;
+                    return (0, None);
                 }
 
-                let ru_share = (total_pool * (curve.runner_up_bps as i128)) / 10_000;
+                let ru_share =
+                    Self::scaled_weight_boundary(&env, total_pool, curve.runner_up_bps);
                 let win_share = total_pool - ru_share;
-
                 if bet.outcome_index == market.winning_outcome {
-                    (bet.amount * win_share) / win_pool
+                    Self::proportional_payout(
+                        &env,
+                        market_id,
+                        bet.outcome_index,
+                        bet.amount,
+                        win_share,
+                        win_pool,
+                    )
                 } else if bet.outcome_index == curve.runner_up_outcome {
-                    (bet.amount * ru_share) / ru_pool
+                    Self::proportional_payout(
+                        &env,
+                        market_id,
+                        bet.outcome_index,
+                        bet.amount,
+                        ru_share,
+                        ru_pool,
+                    )
                 } else {
-                    0
+                    (0, None)
                 }
             }
             PayoutCurveConfig::CUSTOM_WEIGHTS => {
                 let weight = curve.custom_weights.get(bet.outcome_index).unwrap_or(0);
                 if weight == 0 {
-                    return 0;
+                    return (0, None);
                 }
                 let outcome_pool: i128 = env
                     .storage()
@@ -565,12 +684,20 @@ impl MarketsContract {
                     .get(&DataKey::OutcomePool(market_id, bet.outcome_index))
                     .unwrap_or(0);
                 if outcome_pool == 0 {
-                    return 0;
+                    return (0, None);
                 }
-                let outcome_share = (total_pool * (weight as i128)) / 10_000;
-                (bet.amount * outcome_share) / outcome_pool
+                let outcome_share =
+                    Self::custom_outcome_share(&env, total_pool, &curve, bet.outcome_index);
+                Self::proportional_payout(
+                    &env,
+                    market_id,
+                    bet.outcome_index,
+                    bet.amount,
+                    outcome_share,
+                    outcome_pool,
+                )
             }
-            _ => 0,
+            _ => (0, None),
         }
     }
 }
@@ -667,6 +794,14 @@ impl MarketsContract {
         env.storage().persistent().get(&DataKey::Admin)
     }
 
+    /// Returns the configured market limit, or the finite default if unset.
+    pub fn get_market_limit(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MarketLimit)
+            .unwrap_or(DEFAULT_MAX_MARKET_COUNT)
+    }
+
     // -----------------------------------------------------------------------
     //  Market Lifecycle
     // -----------------------------------------------------------------------
@@ -717,6 +852,9 @@ impl MarketsContract {
             .persistent()
             .get(&DataKey::MarketCounter)
             .unwrap_or(0u32);
+        if counter >= Self::get_market_limit(env.clone()) {
+            panic_with_error!(env, ContractError::MarketLimitReached);
+        }
 
         let market_id = match counter.checked_add(1) {
             Some(id) => id,
@@ -983,7 +1121,8 @@ impl MarketsContract {
 
     /// Previews the claimant's payout after the liquidity-provider share is reserved.
     pub fn calculate_payout(env: Env, market_id: u32, claimant: Address) -> i128 {
-        let gross_payout = Self::calculate_gross_payout(env.clone(), market_id, claimant);
+        let (gross_payout, _) =
+            Self::calculate_payout_with_remainder(env.clone(), market_id, claimant);
         gross_payout - Self::lp_payout_fee(&env, market_id, gross_payout)
     }
 
@@ -1020,14 +1159,21 @@ impl MarketsContract {
             None => panic_with_error!(env, ContractError::InvalidState),
         };
 
-        let gross_payout = Self::calculate_gross_payout(env.clone(), market_id, claimant.clone());
-        if gross_payout <= 0 {
+        let (gross_payout, remainder) =
+            Self::calculate_payout_with_remainder(env.clone(), market_id, claimant.clone());
+        if gross_payout < 0 || (gross_payout == 0 && remainder.is_none()) {
             panic_with_error!(env, ContractError::InvalidOutcome);
         }
         let lp_fee = Self::lp_payout_fee(&env, market_id, gross_payout);
         let payout = gross_payout - lp_fee;
 
         // ── EFFECTS ──────────────────────────────────────────────────────────
+        if let Some((outcome_index, value)) = remainder {
+            env.storage().persistent().set(
+                &DataKey::PayoutRemainder(market_id, outcome_index),
+                &value,
+            );
+        }
         // Mark bet as claimed before external interaction
         env.storage()
             .persistent()
@@ -1489,6 +1635,17 @@ impl MarketsContract {
     // -----------------------------------------------------------------------
     //  Issue #007: Hardened Admin Pause Mechanism
     // -----------------------------------------------------------------------
+
+    /// Set the maximum number of markets that may be created.
+    pub fn set_market_limit(env: Env, admin: Address, max_market_count: u32) {
+        Self::require_admin(&env, &admin);
+        if max_market_count == 0 {
+            panic_with_error!(env, ContractError::InvalidConfig);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::MarketLimit, &max_market_count);
+    }
 
     /// Configures the pause protection parameters (delay and required approvals) (#007).
     pub fn set_pause_config(env: Env, admin: Address, delay_seconds: u64, required_approvals: u32) {

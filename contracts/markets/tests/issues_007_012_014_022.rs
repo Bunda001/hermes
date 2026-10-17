@@ -340,7 +340,7 @@ fn test_liquidity_providers_receive_pro_rata_winning_payout_share() {
     te.client.place_bet(&te.bettor2, &market_id, &1, &900);
     te.client.resolve_market(&te.creator, &market_id, &0);
 
-    // The 10% LP share is withheld from the winning bettor and split 1:3.
+    // Reserve 10% of the winner's gross payout and split it 1:3 by liquidity.
     assert_eq!(te.client.calculate_payout(&market_id, &te.bettor1), 900);
     assert_eq!(te.client.claim_winnings(&te.bettor1, &market_id), 900);
     assert_eq!(te.client.collect_fees(&te.admin1, &market_id), 25);
@@ -365,6 +365,51 @@ fn test_removing_liquidity_preserves_accrued_rewards() {
     // Removing principal does not forfeit rewards earned before removal.
     assert_eq!(te.client.collect_fees(&te.admin1, &market_id), 50);
     assert_eq!(te.client.collect_fees(&te.admin2, &market_id), 50);
+}
+
+#[test]
+fn test_winner_takes_all_carries_fractional_payout_remainders() {
+    let te = setup_test_env();
+    let market_id = create_standard_market(&te, 2);
+
+    te.client.place_bet(&te.bettor1, &market_id, &0, &1);
+    te.client.place_bet(&te.bettor2, &market_id, &0, &2);
+    te.client.place_bet(&te.bettor3, &market_id, &1, &2);
+    let resolve_time = te.env.ledger().timestamp() + 86_401;
+    te.env.ledger().set_timestamp(resolve_time);
+    te.client.resolve_market(&te.creator, &market_id, &0);
+
+    assert_eq!(te.client.calculate_payout(&market_id, &te.bettor1), 1);
+    assert_eq!(te.client.calculate_payout(&market_id, &te.bettor2), 3);
+
+    let first_payout = te.client.claim_winnings(&te.bettor1, &market_id);
+    assert_eq!(first_payout, 1);
+    assert_eq!(te.client.calculate_payout(&market_id, &te.bettor2), 4);
+
+    let second_payout = te.client.claim_winnings(&te.bettor2, &market_id);
+    assert_eq!(first_payout + second_payout, 5);
+}
+
+#[test]
+fn test_multiple_winning_outcomes_allocate_split_remainder() {
+    let te = setup_test_env();
+    let market_id = create_standard_market(&te, 3);
+
+    te.client.place_bet(&te.bettor1, &market_id, &0, &1);
+    te.client.place_bet(&te.bettor2, &market_id, &1, &1);
+    te.client.place_bet(&te.bettor3, &market_id, &2, &3);
+
+    let resolve_time = te.env.ledger().timestamp() + 86_401;
+    te.env.ledger().set_timestamp(resolve_time);
+    let winning_outcomes = Vec::from_array(&te.env, [0u32, 1u32]);
+    te.client
+        .resolve_market_with_outcomes(&te.creator, &market_id, &winning_outcomes);
+
+    let first_payout = te.client.claim_winnings(&te.bettor1, &market_id);
+    let second_payout = te.client.claim_winnings(&te.bettor2, &market_id);
+    assert_eq!(first_payout, 3);
+    assert_eq!(second_payout, 2);
+    assert_eq!(first_payout + second_payout, 5);
 }
 
 #[test]

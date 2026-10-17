@@ -17,18 +17,20 @@ table is the audit surface for admin access.
 | --- | --- | --- | --- |
 | `initialize(env, admin)` | The `admin` address must authorize the call (`admin.require_auth()`). Succeeds at most once. | Yes — `DataKey::Admin` (instance) | `Result<(), ContractError>` |
 | `admin(env)` | None — read-only view. | No | `Result<Address, ContractError>` |
-| `set_admin_cooldown(env, admin, seconds)` | `admin.require_auth()` **and** `admin` must equal the stored admin. | Yes — `DataKey::AdminCooldownSeconds` (persistent) | `Result<(), ContractError>` |
-| `get_admin_cooldown(env)` | None — read-only view. | No | `u64` (`0` when unset) |
+| `set_admin_cooldown(env, admin, seconds)` | `admin.require_auth()` **and** `admin` must equal the stored admin. `seconds` must be at least 60. | Yes — `DataKey::AdminCooldownSeconds` (persistent) | `Result<(), ContractError>` |
+| `disable_admin_cooldown(env, admin)` | `admin.require_auth()` **and** `admin` must equal the stored admin. | Yes — `DataKey::AdminCooldownSeconds` (persistent, set to 0) | `Result<(), ContractError>` |
+| `get_admin_cooldown(env)` | None — read-only view. | No | `u64` (`0` when unset or explicitly disabled) |
 | `check_admin_cooldown(env, admin, function_name)` | `admin.require_auth()` **and** `admin` must equal the stored admin. | Yes — `DataKey::AdminLastAction(function_name)` on success only | `Result<(), ContractError>` |
 
 ### Authorization notes
 
 - **`initialize`** is the only way to set the admin, and it is deliberately not
   idempotent: a second call returns `AlreadyInitialized` (`1`).
-- **`set_admin_cooldown`** and **`check_admin_cooldown`** are the only mutating
-  entrypoints that read the stored admin. Both return `AdminNotSet` (`2`) before
-  initialization, and `Unauthorized` (`3`) for any caller that has not proved it
-  is the stored admin. Authorization is checked *before* any storage write.
+- **`set_admin_cooldown`**, **`disable_admin_cooldown`**, and
+  **`check_admin_cooldown`** return `AdminNotSet` (`2`) before initialization,
+  and `Unauthorized` (`3`) unless the caller is the stored admin. Authorization
+  is checked before any storage write. Use `disable_admin_cooldown` to explicitly
+  disable enforcement; `set_admin_cooldown` rejects zero.
 - **`check_admin_cooldown`** is the throttle other contracts call. While the
   cooldown is active it returns `AdminActionTimelocked` (`4`) and does **not**
   update the last-action timestamp, so a blocked call does not extend the window.
@@ -41,6 +43,7 @@ table is the audit surface for admin access.
 pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError>
 pub fn admin(env: Env) -> Result<Address, ContractError>
 pub fn set_admin_cooldown(env: Env, admin: Address, seconds: u64) -> Result<(), ContractError>
+pub fn disable_admin_cooldown(env: Env, admin: Address) -> Result<(), ContractError>
 pub fn get_admin_cooldown(env: Env) -> u64
 pub fn check_admin_cooldown(env: Env, admin: Address, function_name: Symbol) -> Result<(), ContractError>
 ```
@@ -70,3 +73,4 @@ cargo test -p admin --test gas_snap
 - `AdminNotSet = 2`: No admin configured
 - `Unauthorized = 3`: Caller is not the admin
 - `AdminActionTimelocked = 4`: Cooldown period has not elapsed
+- `InvalidCooldown = 5`: Cooldown must be at least 60 seconds
