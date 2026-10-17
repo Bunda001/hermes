@@ -6,6 +6,24 @@
 //! Provides a prediction-market subsystem where every state-changing
 //! entrypoint enforces `require_auth` on the acting [`Address`].
 //!
+//! # User Balance Fee Model
+//!
+//! Deposits are fee-free: `deposit_user_balance` credits the full deposited
+//! amount to the user's internal balance. Fees are charged on exit instead.
+//! `withdraw_user_balance` charges the greater of the configured minimum fee
+//! and the basis-point fee on the requested withdrawal amount, except when
+//! dust or full-withdrawal rules waive the fee. It removes the requested amount
+//! from the internal balance and returns the post-fee `net_amount`; it does not
+//! transfer tokens. `collect_user_fees` is a separate admin-triggered charge
+//! based on the user's full current balance; it deducts from that balance and
+//! adds to the collected-fees counter, without transferring tokens out of the
+//! contract.
+//!
+//! These two fee paths are not mutually exclusive. An admin collection does
+//! not mark funds as already charged, so a later user withdrawal can charge
+//! another fee on the remaining balance. Callers should not use both paths for
+//! the same funds when only one fee is intended.
+//!
 //! # Auth Matrix
 //!
 //! | Function                    | Required Role              |
@@ -1214,24 +1232,122 @@ impl MarketsContract {
         env.storage().instance().get(&DataKey::Admin)
     }
 
-    /// @notice Returns whether the markets subsystem is globally paused.
-    /// @dev    Read-only — does not require auth.
-    /// @param env The contract environment.
-    /// @return `true` if paused, `false` otherwise.
-    pub fn is_paused(env: Env) -> bool {
+    /// Deposits funds into a user's internal withdrawable balance (#012).
+    ///
+    /// No fee is charged on deposit; the full `amount` is transferred in and
+    /// credited to the user's internal balance.
+    pub fn deposit_user_balance(env: Env, user: Address, amount: i128) {
+        user.require_auth();
+
+        if amount <= 0 {
+            panic_with_error!(env, ContractError::StakeTooSmall);
+        }
+
+        let balance = Self::get_user_balance(env.clone(), user.clone());
+        let new_balance = match balance.checked_add(amount) {
+            Some(b) => b,
+            None => panic_with_error!(env, ContractError::Overflow),
+        };
+
+        let token_address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokenAddress)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::InvalidState));
+        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+        token_client.transfer(&user, &env.current_contract_address(), &amount);
+
         env.storage()
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
     }
 
-    // -----------------------------------------------------------------------
-    //  Internal helpers
-    // -----------------------------------------------------------------------
+    /// Withdraws funds from a user's balance with dust protection (#012).
+    ///
+    /// The fee is calculated from the requested `amount` as the greater of
+    /// the configured minimum and the basis-point fee. The full requested
+    /// amount is removed from the internal balance, and the post-fee amount is
+    /// returned as `net_amount`; this method does not transfer tokens. The fee
+    /// is added to the collected-fees counter. This is independent of
+    /// `collect_user_fees`, so both paths can charge fees against the same
+    /// funds at different times.
+    ///
+    /// # Dust Invariant
+    /// If the user's available balance is `<= min_fee_amount`, it is classified
+    /// as dust. To prevent funds from being permanently locked, the minimum fee
+    /// is waived when withdrawing remaining dust.
+    pub fn withdraw_user_balance(env: Env, user: Address, amount: i128) -> WithdrawalResult {
+        user.require_auth();
 
-    /// Sets the maximum number of markets that may be created. A zero limit
-    /// disables market creation; a limit below the current count blocks new markets.
-    pub fn set_market_limit(env: Env, admin: Address, max_market_count: u32) {
+        if amount <= 0 {
+            panic_with_error!(env, ContractError::StakeTooSmall);
+        }
+
+        let balance = Self::get_user_balance(env.clone(), user.clone());
+        if amount > balance {
+            panic_with_error!(env, ContractError::InsufficientBalance);
+        }
+
+        let (min_fee, fee_bps) = Self::get_fee_config(env.clone());
+
+        let (net_amount, fee_deducted) = if balance <= min_fee {
+            // Balance is at or below min_fee (dust): waive fee so dust is never locked!
+            (amount, 0i128)
+        } else {
+            // Normal balance above min_fee
+            let percentage_fee = (amount * fee_bps) / 10_000;
+            let standard_fee = core::cmp::max(percentage_fee, min_fee);
+
+            if amount == balance {
+                // Full withdrawal: if amount cannot cover standard_fee, adjust fee
+                if amount <= standard_fee {
+                    (amount, 0i128)
+                } else {
+                    (amount - standard_fee, standard_fee)
+                }
+            } else {
+                // Partial withdrawal
+                if amount <= standard_fee {
+                    panic_with_error!(env, ContractError::StakeTooSmall);
+                }
+                (amount - standard_fee, standard_fee)
+            }
+        };
+
+        let new_balance = balance - amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserBalance(user), &new_balance);
+
+        if fee_deducted > 0 {
+            let collected = Self::get_collected_fees(env.clone());
+            let new_collected = match collected.checked_add(fee_deducted) {
+                Some(c) => c,
+                None => panic_with_error!(env, ContractError::Overflow),
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::CollectedFees, &new_collected);
+        }
+
+        WithdrawalResult {
+            net_amount,
+            fee_deducted,
+            remaining_balance: new_balance,
+        }
+    }
+
+    /// Admin fee collection from user account with dust-safe protection (#012).
+    ///
+    /// This charges against the user's full current internal balance and adds
+    /// the amount to the collected-fees counter; it does not transfer tokens
+    /// out of the contract. It is independent of `withdraw_user_balance`, so
+    /// a later withdrawal can charge another fee on the remaining balance.
+    ///
+    /// If a user balance is `<= min_fee_amount`, fees are not collected and 0 is returned,
+    /// ensuring dust is never locked and `InsufficientBalance` is never thrown.
+    pub fn collect_user_fees(env: Env, admin: Address, user: Address) -> i128 {
         Self::require_admin(&env, &admin);
         env.storage()
             .persistent()

@@ -204,6 +204,23 @@ fn test_update_fee_config_rejects_negative_values() {
     }
 }
 
+#[test]
+fn test_update_fee_config_rejects_zero_minimum_when_fees_enabled() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let client = register_and_initialize(&env, &admin);
+
+    let mut config = default_fee_config();
+    config.min_fee_amount = 0;
+    config.max_fee_amount = 0;
+
+    let result = client.try_update_fee_config(&admin, &config);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidInput))));
+
+    config.fees_enabled = false;
+    client.update_fee_config(&admin, &config);
+}
+
 // ============================================================
 // Auth Boundary Tests — set_platform_fee
 // ============================================================

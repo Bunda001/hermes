@@ -50,6 +50,7 @@ pub enum DisputeStatus {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Dispute {
+    pub id: u32,
     pub market_id: Symbol,
     pub creator: Symbol,
     pub status: DisputeStatus,
@@ -161,6 +162,26 @@ public struct EscalationRecord {
     pub resolved: bool,
 }
 
+#[contracttype]
+#[derive(Clone)]
+enum DataKey {
+    DisputeCounter,
+    Dispute(u32),
+}
+
+fn load_dispute(env: &Env, id: u32) -> Dispute {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Dispute(id))
+        .unwrap_or_else(|| panic!("dispute not found"))
+}
+
+fn store_dispute(env: &Env, dispute: &Dispute) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::Dispute(dispute.id), dispute);
+}
+
 #[contract]
 pub struct DisputesContract;
 
@@ -253,24 +274,48 @@ impl DisputesContract {
         }
     }
 
+    /// Returns a dispute by its persistent ID, if it exists.
+    pub fn get_dispute(env: Env, id: u32) -> Option<Dispute> {
+        env.storage().persistent().get(&DataKey::Dispute(id))
+    }
+
     /// Open a new dispute for a market. The dispute begins in the
-    /// `Open` status; community voting has not yet started.
-    pub fn open_dispute(_env: Env, market_id: Symbol, creator: Symbol) -> Dispute {
-        Dispute {
+    /// `Open` status; community voting has not yet started. Its allocated ID
+    /// can be used to retrieve the persisted dispute and identify it in later
+    /// lifecycle transitions.
+    pub fn open_dispute(env: Env, market_id: Symbol, creator: Symbol) -> Dispute {
+        let previous_id: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeCounter)
+            .unwrap_or(0);
+        let id = previous_id
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("dispute ID overflow"));
+        let dispute = Dispute {
+            id,
             market_id,
             creator,
             status: DisputeStatus::Open,
             outcome: DisputeOutcome::Pending,
-        }
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeCounter, &id);
+        store_dispute(&env, &dispute);
+        dispute
     }
 
     /// Transition a dispute from `Open` to `Voting`. Once voting has
-    /// begun the dispute can no longer be withdrawn by its creator.
-    pub fn start_voting(_env: Env, mut dispute: Dispute) -> Dispute {
+    /// begun the dispute can no longer be withdrawn by its creator. The
+    /// persisted record is authoritative; only the supplied ID is used.
+    pub fn start_voting(env: Env, dispute: Dispute) -> Dispute {
+        let mut dispute = load_dispute(&env, dispute.id);
         if dispute.status != DisputeStatus::Open {
             panic!("dispute is not open");
         }
         dispute.status = DisputeStatus::Voting;
+        store_dispute(&env, &dispute);
         dispute
     }
 
@@ -279,7 +324,8 @@ impl DisputesContract {
     /// before community voting has begun). This prevents a creator from
     /// opening a frivolous dispute to delay resolution and then
     /// cancelling it mid-vote to avoid an unfavourable ruling.
-    pub fn withdraw_dispute(_env: Env, mut dispute: Dispute, caller: Symbol) -> Dispute {
+    pub fn withdraw_dispute(env: Env, dispute: Dispute, caller: Symbol) -> Dispute {
+        let mut dispute = load_dispute(&env, dispute.id);
         if caller != dispute.creator {
             panic!("only the dispute creator may withdraw");
         }
@@ -287,16 +333,18 @@ impl DisputesContract {
             panic!"cannot withdraw a dispute once voting has begun");
         }
         dispute.status = DisputeStatus::Withdrawn;
+        store_dispute(&env, &dispute);
         dispute
     }
 
     /// Record a binding resolution for a dispute. Only permitted while
     /// the dispute is in the `Voting` status.
     pub fn resolve_dispute(
-        _env: Env,
-        mut dispute: Dispute,
+        env: Env,
+        dispute: Dispute,
         outcome: DisputeOutcome,
     ) -> Dispute {
+        let mut dispute = load_dispute(&env, dispute.id);
         if dispute.status != DisputeStatus::Voting {
             panic!("dispute is not in voting");
         }
@@ -305,6 +353,7 @@ impl DisputesContract {
         }
         dispute.status = DisputeStatus::Resolved;
         dispute.outcome = outcome;
+        store_dispute(&env, &dispute);
         dispute
     }
 }
