@@ -228,11 +228,31 @@ fn test_set_platform_fee_succeeds_with_admin_auth() {
     let admin = Address::generate(&env);
     let client = register_and_initialize(&env, &admin);
 
+    let original_config = client.get_fee_config();
     client.set_platform_fee(&admin, &300);
+    assert_eq!(client.get_fee_config(), original_config);
+
+    let pending = client
+        .get_pending_fee_config()
+        .expect("platform fee update should be queued");
+    assert_eq!(pending.config.platform_fee_percentage, 300);
+    assert_eq!(pending.apply_eta, env.ledger().timestamp() + 86_400);
+
+    let early_result = client.try_apply_fee_update(&admin);
+    match early_result {
+        Err(Ok(ContractError::FeeRevealTooEarly)) => {}
+        other => panic!("Expected FeeRevealTooEarly, got: {:?}", other),
+    }
 
     let auths = env.auths();
     assert_eq!(auths.len(), 1);
     assert_eq!(auths[0].0, admin);
+
+    env.ledger().with_mut(|ledger| {
+        ledger.timestamp += 86_400;
+    });
+    client.apply_fee_update(&admin);
+    assert_eq!(client.get_fee_config().platform_fee_percentage, 300);
 }
 
 #[test]

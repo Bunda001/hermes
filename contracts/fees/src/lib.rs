@@ -102,6 +102,8 @@ enum DataKey {
 
 /// Default timelock cooldown in seconds for fee updates (24 hours).
 const DEFAULT_TIMELOCK_SECONDS: u64 = 86_400;
+/// Minimum timelock cooldown in seconds for fee updates (1 hour).
+const MIN_TIMELOCK_SECONDS: u64 = 3_600;
 
 /// Maximum platform fee percentage in basis points (100% = 10_000).
 const MAX_FEE_PERCENTAGE: i128 = 10_000;
@@ -306,27 +308,7 @@ impl FeesContract {
         // Ensure fees are not paused for config updates (consistency)
         Self::assert_fees_not_paused(&env)?;
 
-        let now = env.ledger().timestamp();
-        let eta = now.saturating_add(DEFAULT_TIMELOCK_SECONDS);
-
-        let queued = PendingFeeConfig {
-            config: new_config.clone(),
-            admin: admin.clone(),
-            proposed_at: now,
-            apply_eta: eta,
-        };
-
-        // Queue pending configuration for governance inspection
-        env.storage()
-            .persistent()
-            .set(&Symbol::new(&env, FEE_QUEUED_KEY), &queued);
-
-        // Consume active commit if present
-        env.storage()
-            .persistent()
-            .remove(&Symbol::new(&env, FEE_COMMIT_KEY));
-
-        Ok(())
+        Self::queue_fee_config(&env, &admin, new_config, DEFAULT_TIMELOCK_SECONDS)
     }
 
     /// Applies a previously queued fee configuration update after its timelock has expired.
@@ -385,6 +367,7 @@ impl FeesContract {
     /// Sets only the platform fee percentage.
     ///
     /// Convenience entrypoint that preserves all other fee configuration values.
+    /// The update is queued and subject to the standard fee configuration timelock.
     ///
     /// # Authorization
     /// The `admin` caller must authenticate via `require_auth()` and be the
@@ -408,11 +391,7 @@ impl FeesContract {
 
         let mut config = Self::get_fee_config_internal(&env)?;
         config.platform_fee_percentage = fee_percentage;
-        env.storage()
-            .persistent()
-            .set(&Symbol::new(&env, FEE_CONFIG_KEY), &config);
-
-        Ok(())
+        Self::queue_fee_config(&env, &admin, config, DEFAULT_TIMELOCK_SECONDS)
     }
 
     /// Authorizes a contract to record fees.
@@ -742,6 +721,34 @@ impl FeesContract {
             .get(&Symbol::new(env, FEE_QUEUED_KEY))
     }
 
+    fn queue_fee_config(
+        env: &Env,
+        admin: &Address,
+        config: FeeConfig,
+        delay_seconds: u64,
+    ) -> Result<(), ContractError> {
+        if delay_seconds < MIN_TIMELOCK_SECONDS {
+            return Err(ContractError::InvalidInput);
+        }
+
+        let now = env.ledger().timestamp();
+        let queued = PendingFeeConfig {
+            config,
+            admin: admin.clone(),
+            proposed_at: now,
+            apply_eta: now.saturating_add(delay_seconds),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(env, FEE_QUEUED_KEY), &queued);
+        env.storage()
+            .persistent()
+            .remove(&Symbol::new(env, FEE_COMMIT_KEY));
+
+        Ok(())
+    }
+
     /// Validates the caller is the registered admin.
     fn assert_is_admin(env: &Env, caller: &Address) -> Result<(), ContractError> {
         let stored_admin = Self::get_admin_internal(env)?;
@@ -816,5 +823,35 @@ impl FeesContract {
             return Err(ContractError::InvalidInput);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn queue_fee_config_rejects_delay_below_minimum() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let config = FeeConfig {
+            platform_fee_percentage: 200,
+            creation_fee: 0,
+            min_fee_amount: 1,
+            max_fee_amount: MAX_FEE_AMOUNT,
+            collection_threshold: 100_000_000,
+            fees_enabled: true,
+        };
+
+        assert_eq!(
+            FeesContract::queue_fee_config(
+                &env,
+                &admin,
+                config,
+                MIN_TIMELOCK_SECONDS - 1,
+            ),
+            Err(ContractError::InvalidInput)
+        );
     }
 }
