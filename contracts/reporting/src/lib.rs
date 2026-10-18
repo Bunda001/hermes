@@ -31,8 +31,6 @@
 
 #![no_std]
 
-extern crate std;
-
 mod err;
 mod events;
 mod pause;
@@ -41,7 +39,7 @@ mod types;
 pub use err::ReportingError;
 pub use types::{DataKey, Report};
 
-use soroban_sdk::{contract, contractimpl, Address, Env, String};
+use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
 
 /// The Reporting contract.
 #[contract]
