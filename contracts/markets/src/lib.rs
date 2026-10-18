@@ -1187,6 +1187,8 @@ impl MarketsContract {
     }
 
     /// Cancels a market before it has been resolved.
+    ///
+    /// Only the market creator or a platform admin may cancel a market.
     pub fn cancel_market(env: Env, caller: Address, market_id: u32) {
         caller.require_auth();
 
@@ -1195,6 +1197,11 @@ impl MarketsContract {
                 Some(m) => m,
                 None => panic_with_error!(env, ContractError::MarketNotFound),
             };
+
+        // Role check: caller must be the market creator or a platform admin.
+        if caller != market.creator && !Self::is_admin_internal(&env, &caller) {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
 
         if market.resolved {
             panic_with_error!(env, ContractError::MarketAlreadyResolved);
@@ -1279,7 +1286,7 @@ impl MarketsContract {
             .unwrap_or_else(|| panic_with_error!(env, ContractError::Overflow));
 
         env.storage().persistent().set(
-            &DataKey::Liquidity(market_id, provider),
+            &DataKey::Liquidity(market_id, provider.clone()),
             &LiquidityData {
                 total_amount: new_total,
             },
@@ -1329,7 +1336,7 @@ impl MarketsContract {
             .unwrap_or_else(|| panic_with_error!(env, ContractError::InvalidState));
 
         env.storage().persistent().set(
-            &DataKey::Liquidity(market_id, provider),
+            &DataKey::Liquidity(market_id, provider.clone()),
             &LiquidityData {
                 total_amount: new_total,
             },
