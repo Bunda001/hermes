@@ -603,7 +603,7 @@ A: Not recommended. Use testnet for all drills. Emergency halt should only be us
 
 ## Additional Resources
 
-- **Full Design Doc**: `/PLATFORM_EMERGENCY_HALT_DESIGN.md`
+- **Full Design Doc**: `../design/PLATFORM_EMERGENCY_HALT_DESIGN.md`
 - **Implementation Plan**: `/EMERGENCY_HALT_IMPLEMENTATION_PLAN.md`
 - **Integration Guide**: `/EMERGENCY_HALT_INTEGRATION_GUIDE.md`
 - **Contract Code**: `/contracts/emergency-halt/src/`

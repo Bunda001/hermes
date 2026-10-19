@@ -28,7 +28,7 @@ This directory contains comprehensive documentation for implementing a **Platfor
 
 ---
 
-### 2. **PLATFORM_EMERGENCY_HALT_DESIGN.md**
+### 2. **[PLATFORM_EMERGENCY_HALT_DESIGN.md](../design/PLATFORM_EMERGENCY_HALT_DESIGN.md)**
 **Complete technical specification**
 
 - Architecture and design patterns
@@ -109,13 +109,13 @@ This directory contains comprehensive documentation for implementing a **Platfor
 
 **Engineering Lead**
 1. Start: EMERGENCY_HALT_SUMMARY.md (entire document)
-2. Then: PLATFORM_EMERGENCY_HALT_DESIGN.md (Architecture section)
+2. Then: [PLATFORM_EMERGENCY_HALT_DESIGN.md](../design/PLATFORM_EMERGENCY_HALT_DESIGN.md) (Architecture section)
 3. Then: EMERGENCY_HALT_IMPLEMENTATION_PLAN.md (full roadmap)
 
 **Implementing Engineer**
 1. Start: EMERGENCY_HALT_IMPLEMENTATION_PLAN.md (Phase for your task)
 2. Reference: EMERGENCY_HALT_INTEGRATION_GUIDE.md (ongoing)
-3. Check: PLATFORM_EMERGENCY_HALT_DESIGN.md (specific details)
+3. Check: [PLATFORM_EMERGENCY_HALT_DESIGN.md](../design/PLATFORM_EMERGENCY_HALT_DESIGN.md) (specific details)
 
 **Platform Operator**
 1. Learn: EMERGENCY_HALT_QUICK_REFERENCE.md (API & Workflow sections)
@@ -123,7 +123,7 @@ This directory contains comprehensive documentation for implementing a **Platfor
 3. Reference: Troubleshooting Guide (when issues occur)
 
 **Security Reviewer**
-1. Start: PLATFORM_EMERGENCY_HALT_DESIGN.md (Security Considerations)
+1. Start: [PLATFORM_EMERGENCY_HALT_DESIGN.md](../design/PLATFORM_EMERGENCY_HALT_DESIGN.md) (Security Considerations)
 2. Then: EMERGENCY_HALT_INTEGRATION_GUIDE.md (Cross-Contract Interface)
 3. Review: Implementation code for auth patterns
 
@@ -144,13 +144,13 @@ This directory contains comprehensive documentation for implementing a **Platfor
 → EMERGENCY_HALT_INTEGRATION_GUIDE.md - Integration Checklist for Each Subsystem
 
 **"What's the exact API?"**
-→ PLATFORM_EMERGENCY_HALT_DESIGN.md - Entrypoints section
+→ [PLATFORM_EMERGENCY_HALT_DESIGN.md](../design/PLATFORM_EMERGENCY_HALT_DESIGN.md) - Entrypoints section
 
 **"How long will halt take?"**
 → EMERGENCY_HALT_SUMMARY.md - Implementation Timeline (~4 weeks)
 
 **"What are the error cases?"**
-→ PLATFORM_EMERGENCY_HALT_DESIGN.md - Error Handling section
+→ [PLATFORM_EMERGENCY_HALT_DESIGN.md](../design/PLATFORM_EMERGENCY_HALT_DESIGN.md) - Error Handling section
 
 **"What tests should I write?"**
 → EMERGENCY_HALT_INTEGRATION_GUIDE.md - Testing Pyramid
@@ -166,12 +166,12 @@ This directory contains comprehensive documentation for implementing a **Platfor
 - [ ] Read EMERGENCY_HALT_SUMMARY.md
 - [ ] Discuss design with team
 - [ ] Get stakeholder approval
-- [ ] Review PLATFORM_EMERGENCY_HALT_DESIGN.md in detail
+- [ ] Review [PLATFORM_EMERGENCY_HALT_DESIGN.md](../design/PLATFORM_EMERGENCY_HALT_DESIGN.md) in detail
 - [ ] Assign phase leads
 
 ### Phase 1: EHC Contract (Week 1-2)
 - [ ] Follow Phase 1 in EMERGENCY_HALT_IMPLEMENTATION_PLAN.md
-- [ ] Reference PLATFORM_EMERGENCY_HALT_DESIGN.md for details
+- [ ] Reference [PLATFORM_EMERGENCY_HALT_DESIGN.md](../design/PLATFORM_EMERGENCY_HALT_DESIGN.md) for details
 - [ ] Use EMERGENCY_HALT_INTEGRATION_GUIDE.md for storage schema
 - [ ] Write tests per Testing Pyramid in guide
 
@@ -247,7 +247,7 @@ A: Yes - see Phased Rollout in EMERGENCY_HALT_IMPLEMENTATION_PLAN.md
 /workspaces/hermes/
 ├── EMERGENCY_HALT_INDEX.md (this file)
 ├── EMERGENCY_HALT_SUMMARY.md (executive overview)
-├── PLATFORM_EMERGENCY_HALT_DESIGN.md (technical spec)
+├── ../design/PLATFORM_EMERGENCY_HALT_DESIGN.md (technical spec)
 ├── EMERGENCY_HALT_IMPLEMENTATION_PLAN.md (phased roadmap)
 ├── EMERGENCY_HALT_INTEGRATION_GUIDE.md (integration reference)
 ├── EMERGENCY_HALT_QUICK_REFERENCE.md (ops guide)

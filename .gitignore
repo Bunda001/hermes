@@ -5,3 +5,4 @@ commit_out.txt
 target/
 *.rs.bk
 /contracts/oracles/test_snapshots/
+/full_structure3.txt

@@ -45,5 +45,5 @@ This fix should be deployed before any production chain reaches sequence numbers
 
 ## References
 - Vulnerable Code: `/workspaces/hermes/contracts/predictify-hybrid/src/storage.rs`
-- Documentation: `/workspaces/hermes/OVERFLOW_VULNERABILITY_FIX.md`
+- Documentation: `OVERFLOW_VULNERABILITY_FIX.md`
 - Tests: `/workspaces/hermes/contracts/predictify-hybrid/src/storage.rs` (test module)

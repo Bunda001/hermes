@@ -366,7 +366,7 @@ To add a new error:
 2. Run `cargo build` in this contract
 3. Commit the generated `src/errors.rs`
 
-See `../../ERROR_DOCS_SYNC.md` for details.
+See `ERROR_DOCS_SYNC.md` for details.
 ```
 
 ## Repeat for Other Contracts

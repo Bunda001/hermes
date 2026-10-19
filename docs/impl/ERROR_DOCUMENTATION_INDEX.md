@@ -5,7 +5,7 @@
 **New to this solution?** Start here:
 1. Read [`SOLUTION_SUMMARY.md`](./SOLUTION_SUMMARY.md) (5 min) — Problem & solution overview
 2. Read [`ERROR_DOCS_SYNC.md`](./ERROR_DOCS_SYNC.md) (10 min) — Architecture details
-3. See [`crates/hermes-errors/README.md`](./crates/hermes-errors/README.md) — Registry guide
+3. See [`crates/hermes-errors/README.md`](../../crates/hermes-errors/README.md) — Registry guide
 
 **Adding a new error?** Go to:
 → [`CONTRIBUTING_ERRORS.md`](./CONTRIBUTING_ERRORS.md) — Complete workflow
@@ -208,9 +208,9 @@ git commit -m "feat(analytics): add InvalidTimeRange error"
 
 #### 📚 Registry API Reference
 
-**Read:** [`crates/hermes-errors/README.md`](./crates/hermes-errors/README.md)
+**Read:** [`crates/hermes-errors/README.md`](../../crates/hermes-errors/README.md)
 
-**Plus:** [`crates/hermes-errors/src/lib.rs`](./crates/hermes-errors/src/lib.rs) (docstrings in code)
+**Plus:** [`crates/hermes-errors/src/lib.rs`](../../crates/hermes-errors/src/lib.rs) (docstrings in code)
 
 **Topics:**
 - `ErrorDefinition` struct API
@@ -292,7 +292,7 @@ git commit -m "feat(analytics): add InvalidTimeRange error"
 2. [`CONTRIBUTING_ERRORS.md`](./CONTRIBUTING_ERRORS.md) (20 min)
    - Learn how to add/modify errors
 
-3. [`crates/hermes-errors/README.md`](./crates/hermes-errors/README.md) (10 min)
+3. [`crates/hermes-errors/README.md`](../../crates/hermes-errors/README.md) (10 min)
    - Understand registry API
 
 4. **Hands-on:** Add a test error to the registry
@@ -329,7 +329,7 @@ git commit -m "feat(analytics): add InvalidTimeRange error"
 2. [`ERROR_DOCS_SYNC.md`](./ERROR_DOCS_SYNC.md) (30 min)
    - Deep architecture review
 
-3. [`crates/hermes-errors/README.md`](./crates/hermes-errors/README.md) (20 min)
+3. [`crates/hermes-errors/README.md`](../../crates/hermes-errors/README.md) (20 min)
    - Registry design review
 
 4. Code review:
@@ -442,9 +442,9 @@ A: Foundation complete (Week 0), migrate 1 contract/week (4 weeks total).
 | Architecture & design | [`ERROR_DOCS_SYNC.md`](./ERROR_DOCS_SYNC.md) |
 | Adding errors | [`CONTRIBUTING_ERRORS.md`](./CONTRIBUTING_ERRORS.md) |
 | Migrating contracts | [`MIGRATION_ERROR_SYNC.md`](./MIGRATION_ERROR_SYNC.md) |
-| Registry API | [`crates/hermes-errors/README.md`](./crates/hermes-errors/README.md) |
-| Code reference | [`crates/hermes-errors/src/lib.rs`](./crates/hermes-errors/src/lib.rs) |
-| Code generation | [`crates/hermes-codegen/src/lib.rs`](./crates/hermes-codegen/src/lib.rs) |
+| Registry API | [`crates/hermes-errors/README.md`](../../crates/hermes-errors/README.md) |
+| Code reference | [`crates/hermes-errors/src/lib.rs`](../../crates/hermes-errors/src/lib.rs) |
+| Code generation | [`crates/hermes-codegen/src/lib.rs`](../../crates/hermes-codegen/src/lib.rs) |
 
 ---
 
@@ -474,7 +474,7 @@ A: Foundation complete (Week 0), migrate 1 contract/week (4 weeks total).
 | [`ERROR_DOCS_SYNC.md`](./ERROR_DOCS_SYNC.md) | ~600 | Architecture & design |
 | [`MIGRATION_ERROR_SYNC.md`](./MIGRATION_ERROR_SYNC.md) | ~800 | Step-by-step guide |
 | [`CONTRIBUTING_ERRORS.md`](./CONTRIBUTING_ERRORS.md) | ~700 | Error workflow |
-| [`crates/hermes-errors/README.md`](./crates/hermes-errors/README.md) | ~300 | Registry guide |
+| [`crates/hermes-errors/README.md`](../../crates/hermes-errors/README.md) | ~300 | Registry guide |
 | [`ERROR_DOCUMENTATION_INDEX.md`](./ERROR_DOCUMENTATION_INDEX.md) | ~500 | This file (navigation) |
 | **Total Documentation** | **~3,250 lines** | Complete reference |
 

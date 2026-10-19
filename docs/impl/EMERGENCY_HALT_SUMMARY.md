@@ -226,7 +226,7 @@ Each contract adds three components:
 - [ ] Event emission system
 
 ### Documentation
-- [ ] **PLATFORM_EMERGENCY_HALT_DESIGN.md** - Full architecture spec
+- [ ] **[PLATFORM_EMERGENCY_HALT_DESIGN.md](../design/PLATFORM_EMERGENCY_HALT_DESIGN.md)** - Full architecture spec
 - [ ] **EMERGENCY_HALT_IMPLEMENTATION_PLAN.md** - Phased rollout plan
 - [ ] **EMERGENCY_HALT_INTEGRATION_GUIDE.md** - Technical integration guide
 - [ ] **EMERGENCY_HALT_QUICK_REFERENCE.md** - Operations & incident response guide
@@ -385,7 +385,7 @@ A: Use `health_check()` query (no auth required). Returns pause status of all su
 
 All details available in accompanying documents:
 
-1. **PLATFORM_EMERGENCY_HALT_DESIGN.md**
+1. **[PLATFORM_EMERGENCY_HALT_DESIGN.md](../design/PLATFORM_EMERGENCY_HALT_DESIGN.md)**
    - Complete architecture specification
    - Data structures and storage schema
    - Entrypoints and error handling

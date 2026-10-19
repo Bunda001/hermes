@@ -32,6 +32,7 @@
 //! | `get_validator`         | Anyone (read-only)      |
 //! | `is_validator`          | Anyone (read-only)      |
 //! | `validator_count`       | Anyone (read-only)      |
+//! | `list_validators`       | Anyone (read-only)      |
 //! | `is_validators_paused`  | Anyone (read-only)      |
 //! | `admin`                 | Anyone (read-only)      |
 //! | `version`               | Anyone (read-only)      |
@@ -44,7 +45,7 @@ mod types;
 pub use errors::ValidatorError;
 pub use types::{DataKey, ValidatorInfo};
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env};
+use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env, Vec};
 
 /// The Validators contract.
 ///
@@ -107,6 +108,9 @@ impl ValidatorsContract {
         env.storage()
             .persistent()
             .set(&DataKey::ValidatorCount, &0u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ValidatorList, &Vec::<Address>::new(&env));
         env.storage().instance().set(&DataKey::MinStake, &min_stake);
         env.storage().instance().set(&DataKey::MaxStake, &max_stake);
 
@@ -202,6 +206,15 @@ impl ValidatorsContract {
         env.storage()
             .persistent()
             .set(&DataKey::Validator(validator), &info);
+        let mut validators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ValidatorList)
+            .unwrap_or_else(|| Vec::new(&env));
+        validators.push_back(info.address.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::ValidatorList, &validators);
         env.storage()
             .persistent()
             .set(&DataKey::ValidatorCount, &new_count);
@@ -244,7 +257,7 @@ impl ValidatorsContract {
         Self::assert_initialized(&env)?;
         Self::assert_not_paused(&env)?;
 
-        let key = DataKey::Validator(validator);
+        let key = DataKey::Validator(validator.clone());
         if !env.storage().persistent().has(&key) {
             return Err(ValidatorError::ValidatorNotFound);
         }
@@ -253,6 +266,21 @@ impl ValidatorsContract {
         }
 
         env.storage().persistent().remove(&key);
+
+        let registered: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ValidatorList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut remaining = Vec::new(&env);
+        for address in registered.iter() {
+            if address != validator {
+                remaining.push_back(address);
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ValidatorList, &remaining);
 
         let count: u32 = env
             .storage()
@@ -741,6 +769,30 @@ impl ValidatorsContract {
             .persistent()
             .get(&DataKey::ValidatorCount)
             .unwrap_or(0)
+    }
+
+    /// Return a page of registered validator addresses in registration order.
+    ///
+    /// `start` is a zero-based offset and `limit` is the maximum number of
+    /// addresses to return. Deregistered validators are omitted; a validator
+    /// that registers again is appended to the end of the list.
+    pub fn list_validators(env: Env, start: u32, limit: u32) -> Vec<Address> {
+        let validators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ValidatorList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut page = Vec::new(&env);
+        let mut index = start;
+
+        while index < validators.len() && page.len() < limit {
+            if let Some(address) = validators.get(index) {
+                page.push_back(address);
+            }
+            index += 1;
+        }
+
+        page
     }
 
     /// Return whether the validators subsystem is currently paused.

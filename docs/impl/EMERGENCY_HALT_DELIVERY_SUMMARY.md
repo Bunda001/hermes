@@ -22,7 +22,7 @@ A complete, production-ready specification and implementation roadmap for a **Pl
 - Cost-benefit analysis (1+ prevented attack = ROI)
 - Success criteria & metrics
 
-### 3. **PLATFORM_EMERGENCY_HALT_DESIGN.md** (Technical Specification)
+### 3. **[PLATFORM_EMERGENCY_HALT_DESIGN.md](../design/PLATFORM_EMERGENCY_HALT_DESIGN.md)** (Technical Specification)
 - **12 pages**
 - Complete architecture with diagrams
 - Data structures & storage schema
@@ -234,13 +234,13 @@ Final Verification & Resume
 
 ### For Full Technical Understanding (2-3 hours)
 1. Read: EMERGENCY_HALT_SUMMARY.md
-2. Read: PLATFORM_EMERGENCY_HALT_DESIGN.md
+2. Read: [PLATFORM_EMERGENCY_HALT_DESIGN.md](../design/PLATFORM_EMERGENCY_HALT_DESIGN.md)
 3. Read: EMERGENCY_HALT_INTEGRATION_GUIDE.md
 
 ### For Implementation Work (ongoing)
 1. Bookmark: EMERGENCY_HALT_IMPLEMENTATION_PLAN.md (current phase)
 2. Reference: EMERGENCY_HALT_INTEGRATION_GUIDE.md
-3. Use: Code examples and patterns from PLATFORM_EMERGENCY_HALT_DESIGN.md
+3. Use: Code examples and patterns from [PLATFORM_EMERGENCY_HALT_DESIGN.md](../design/PLATFORM_EMERGENCY_HALT_DESIGN.md)
 
 ### For Operational Readiness
 1. Study: EMERGENCY_HALT_QUICK_REFERENCE.md
